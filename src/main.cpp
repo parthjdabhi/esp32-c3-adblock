@@ -689,6 +689,21 @@ static void cachePut(uint64_t key, int n, int qend, bool edns) {
   memcpy(slot->data, buf, n);
 }
 
+// ---------- recent lookups (dashboard) ----------
+// Ring buffer of the last LOG_N lookups: who asked, what, and what we did. Lives on the heap
+// (allocated in setup); names longer than 63 chars are cut. Read via /queries.json (auth).
+static const int LOG_N = 200;
+struct LookupLog { uint32_t ms; uint8_t client; char st; uint16_t qtype; char name[64]; };
+static LookupLog* lookups = nullptr; static uint32_t lookupSeq = 0;
+static void logLookup(const Dev* c, const char* name, uint16_t qtype, char st) {
+  if (!lookups || !name[0]) return;
+  LookupLog& e = lookups[lookupSeq++ % LOG_N];
+  e.ms = millis(); e.client = c ? (uint8_t)(c - clients) : 255; e.st = st; e.qtype = qtype;
+  size_t i = 0;
+  for (; name[i] && i < sizeof(e.name) - 1; i++) { char ch = name[i]; e.name[i] = (ch > 0x20 && ch < 0x7f && ch != '"' && ch != '\\' && ch != '<' && ch != '>') ? ch : '?'; }
+  e.name[i] = 0;
+}
+
 // Answer the query in buf (qlen bytes) for client c. Returns the reply length in buf (0 = none).
 // Drops anything that isn't a plain standard query (idea from upstream PR #26): replies
 // (QR set, e.g. a reflected packet), other opcodes, not exactly one question, or a class
@@ -702,15 +717,19 @@ static int answerQuery(int qlen, Dev* c) {
   bool ban = c && c->banned;
   bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
   int rlen;
-  if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+  // log status: b = blocked by list/custom, n = client banned, c = from cache, f = forwarded, x = no answer
+  char st;
+  if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; st = ban ? 'n' : 'b'; }
   else {
     const bool cacheable = dl && qend <= qlen && ((buf[4] << 8) | buf[5]) == 1;
     const uint64_t key = cacheable ? answerKey(qend) : 0;
     const bool edns = (buf[10] | buf[11]) != 0;
     rlen = cacheable ? cacheGet(key, qend) : 0;
-    if (!rlen) { rlen = forwardUpstream(qlen, qend); if (rlen > 0 && cacheable) cachePut(key, rlen, qend, edns); }
+    st = 'c';
+    if (!rlen) { rlen = forwardUpstream(qlen, qend); st = rlen > 0 ? 'f' : 'x'; if (rlen > 0 && cacheable) cachePut(key, rlen, qend, edns); }
     totalAllowed++; if (c) c->allowed++;
   }
+  if (dl) logLookup(c, domain, qtype, st);
   return rlen;
 }
 
@@ -1208,6 +1227,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
+  lookups = (LookupLog*)calloc(LOG_N, sizeof(LookupLog));
   acache = (CachedAnswer (*)[AC_WAYS])calloc(AC_SETS, sizeof(CachedAnswer[AC_WAYS]));
   if (!acache) Serial.println("[cache] no RAM, answer cache off");
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
@@ -1245,6 +1265,21 @@ void setup() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
+  web.on("/queries.json", []() {          // recent lookups, newest first: [ageSec, clientIp, name, qtype, status]
+    if (!requireAuth()) return;           // it's browsing history, so not public like stats.json
+    String j; j.reserve(12000); j = "{\"q\":[";
+    const uint32_t now = millis(); const uint32_t n = lookupSeq < (uint32_t)LOG_N ? lookupSeq : LOG_N;
+    for (uint32_t k = 0; lookups && k < n; k++) {
+      const LookupLog& e = lookups[(lookupSeq - 1 - k) % LOG_N];
+      String ip = "";
+      if (e.client < numClients) { const Dev& c = clients[e.client];
+        if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); char t6[48]; ip6addr_ntoa_r(&a6, t6, sizeof(t6)); ip = t6; }
+        else ip = IPAddress(c.ip).toString(); }
+      j += k ? "," : ""; j += "[" + String((now - e.ms) / 1000) + ",\"" + ip + "\",\"" + e.name + "\"," + String(e.qtype) + ",\"" + String(e.st) + "\"]";
+    }
+    j += "]}";
+    web.send(200, "application/json", j);
   });
   web.on("/setname", []() {              // /setname?k=<mac or ip>&ip=<ip>&n=<name>  (empty n = remove)
     if (!requireAuth()) return;
