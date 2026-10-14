@@ -902,6 +902,19 @@ static bool checkCredentials() {
   }
   return false;
 }
+// Viewing the dashboard / stats also needs the login (they show device names, MACs and
+// IPs). Reads change nothing, so no CSRF header is needed here, just the password and the
+// same lockout. Build with -DDASHBOARD_OPEN to keep viewing open like before.
+static bool requireView() {
+#ifdef DASHBOARD_OPEN
+  return true;
+#else
+  if (authLocked()) { web.send(429, "text/plain", "too many wrong passwords, try again later"); return false; }
+  if (checkCredentials()) return true;
+  web.requestAuthentication(BASIC_AUTH, "C3 AdBlock");
+  return false;
+#endif
+}
 static bool requireAuth() {
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
   if (authLocked()) { web.send(429, "text/plain", "too many wrong passwords, try again later"); return false; }
@@ -1253,8 +1266,8 @@ void setup() {
   startDns6();
 #endif
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
-  web.on("/", []() { web.send_P(200, "text/html", PAGE); });
-  web.on("/stats.json", handleStats);
+  web.on("/", []() { if (!requireView()) return; web.send_P(200, "text/html", PAGE); });
+  web.on("/stats.json", []() { if (!requireView()) return; handleStats(); });
   web.on("/ban", handleBan);
   web.on("/addblock", []() {
     if (!requireAuth()) return;

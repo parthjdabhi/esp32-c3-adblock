@@ -188,13 +188,16 @@ single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.
 
 ## Security
 
-The dashboard's read-only view (`/`, `/stats.json`) stays open, but every
-state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
-`secrets.h`):
+The whole dashboard needs **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from `secrets.h`),
+including just viewing it (`/`, `/stats.json`), since it shows device names, MACs and IPs.
+Build with `-DDASHBOARD_OPEN` to keep the view open as before. State-changing endpoints
+also need the `X-Requested-With: c3-adblock` header (CSRF guard):
 
-- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`, `/pause`, `/resume`
 - `/upload`, `/update` (blocklist and firmware OTA)
-- `/setupdate`, `/fetchnow`
+- `/setupdate`, `/fetchnow`, `/setdns`, `/setname`, `/queries.json`
+
+5 wrong passwords lock that IP out for 30 s, 10 or more for 5 min.
 
 Network OTA (`ArduinoOTA`, e.g. `pio run -t upload --upload-port c3adblock.local
 --upload-protocol espota`) requires `OTA_PASS` from the same file.
