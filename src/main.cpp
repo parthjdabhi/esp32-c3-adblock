@@ -28,6 +28,13 @@
 #define UPSTREAM_PORT 53
 #endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
+// Optional build flags (platformio.ini build_flags):
+//   -DWIFI_TX_POWER=WIFI_POWER_8_5dBm  lower TX power. Many C3 SuperMini boards have a weak
+//                                      antenna layout and drop WiFi (or the setup AP is not
+//                                      visible) at full power. See [env:c3-supermini].
+//   -DSTATIC_IP=192,168,1,250 -DSTATIC_GW=192,168,1,1 -DSTATIC_MASK=255,255,255,0
+//   -DSTATIC_DNS=9,9,9,9               fixed address for routers without DHCP reservation.
+//                                      Keep it outside the router's DHCP pool.
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -507,7 +514,23 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+#ifdef STATIC_IP
+#ifndef STATIC_MASK
+#define STATIC_MASK 255, 255, 255, 0
+#endif
+#ifndef STATIC_DNS
+#define STATIC_DNS UPSTREAM_IP
+#endif
+  if (WiFi.config(IPAddress(STATIC_IP), IPAddress(STATIC_GW), IPAddress(STATIC_MASK), IPAddress(STATIC_DNS)))
+    Serial.printf("WiFi: static IP %s\n", IPAddress(STATIC_IP).toString().c_str());
+  else
+    Serial.println("WiFi: static IP config failed, using DHCP");
+#endif
+  WiFi.begin(ssid, pass);
+#ifdef WIFI_TX_POWER
+  WiFi.setTxPower(WIFI_TX_POWER);
+#endif
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
@@ -565,6 +588,9 @@ static void startConfigPortal() {
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+#ifdef WIFI_TX_POWER
+  WiFi.setTxPower(WIFI_TX_POWER);
+#endif
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
