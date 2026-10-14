@@ -24,10 +24,18 @@
 #ifndef UPSTREAM_IP
 #define UPSTREAM_IP 9, 9, 9, 9                    // Quad9
 #endif
+#ifndef UPSTREAM2_IP
+#define UPSTREAM2_IP 149, 112, 112, 112           // Quad9 secondary (backup)
+#endif
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
 #endif
-static const IPAddress UPSTREAM(UPSTREAM_IP);
+#ifndef FW_VERSION
+#define FW_VERSION "dev"                          // set by tools/version.py from git describe
+#endif
+static const IPAddress UPSTREAM(UPSTREAM_IP);     // defaults; the dashboard can change both
+static const IPAddress UPSTREAM2(UPSTREAM2_IP);
+static const uint32_t UPSTREAM_TIMEOUT_MS = 800;  // per server; backup gets its own window
 // Optional build flags (platformio.ini build_flags):
 //   -DWIFI_TX_POWER=WIFI_POWER_8_5dBm  lower TX power. Many C3 SuperMini boards have a weak
 //                                      antenna layout and drop WiFi (or the setup AP is not
@@ -49,6 +57,12 @@ WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
+static uint8_t qcopy[1536];   // the client's query, kept so it can be re-sent to the backup
+
+// upstream resolvers: [0] primary, [1] backup (0.0.0.0 = none)
+IPAddress upDns[2] = { UPSTREAM, UPSTREAM2 };
+uint32_t upAnswered[2] = {0, 0}, upTimeouts[2] = {0, 0};
+uint32_t primaryDownUntil = 0;   // while set, try the backup first (primary just timed out)
 
 // first-level flash index (sorted sample hashes) + small direct-mapped cache
 static uint8_t blIndex[INDEX_ENTRIES][HASH_BYTES];
@@ -177,23 +191,45 @@ static bool isBlocked(const char* domain) {
 }
 
 // ---------- persistence ----------
+// Turn what people paste into a bare domain: "https://Max.AppLovin.com/p/x?id=1" ->
+// "max.applovin.com", "*.applovin.com" -> "applovin.com" (a listed domain already covers its
+// subdomains, and the matcher has no wildcards). Returns "" if it isn't a usable domain.
+static String normDomain(String d) {
+  d.trim(); d.toLowerCase();
+  int sch = d.indexOf("://"); if (sch >= 0) d = d.substring(sch + 3);
+  int cut = d.length();
+  for (const char* sep = "/?#:"; *sep; sep++) { int k = d.indexOf(*sep); if (k >= 0 && k < cut) cut = k; }
+  d = d.substring(0, cut);
+  while (d.startsWith("*") || d.startsWith(".")) d = d.substring(1);
+  while (d.endsWith(".")) d.remove(d.length() - 1);
+  if (d.startsWith("www.")) d = d.substring(4);
+  if (d.indexOf('.') <= 0 || d.length() > 253) return "";
+  for (char ch : d) if (!(isalnum((unsigned char)ch) || ch == '.' || ch == '-' || ch == '_')) return "";
+  return d;
+}
+static void saveCustom();
 static void loadCustom() {
+  bool changed = false;
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
-    String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    String raw = f.readStringUntil('\n'); raw.trim();
+    String l = normDomain(raw);
+    bool dup = false; for (int i = 0; i < numCustom; i++) if (customDom[i] == l) dup = true;
+    if (l.length() && !dup) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (raw.length() && (l != raw || dup)) changed = true;   // e.g. an old "*.x.com" entry
   }
   f.close();
+  if (changed) saveCustom();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
 static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  d = normDomain(d);
+  if (!d.length() || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
 static void removeCustom(String d) {
-  d.toLowerCase();
+  d.trim(); d.toLowerCase();
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
     numCustom--; saveCustom(); return;
@@ -246,12 +282,12 @@ static int buildBlocked(int qend, uint16_t qtype) {
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
-// Forward to upstream and wait for the reply that actually belongs to THIS query.
+// Send the query in buf to one resolver and wait for the reply that belongs to THIS query.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
 // to the next client (every answer shifted by one). Now: drain stale datagrams first,
 // send with a fresh random txid, and only accept a reply whose txid, question section,
 // and source address/port match. The client's own txid is restored on the way back.
-static int forwardUpstream(int qlen, int qend) {
+static int askUpstream(const IPAddress& up, int qlen, int qend) {
   upstreamCli.flush();                                   // release any half-read buffer
   while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
   const uint8_t cid0 = buf[0], cid1 = buf[1];
@@ -260,12 +296,13 @@ static int forwardUpstream(int qlen, int qend) {
   const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
   if (haveQ) memcpy(q, buf + 12, ql);
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+  upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+  buf[0] = cid0; buf[1] = cid1;
   const uint32_t t0 = millis();
-  while (millis() - t0 < 1000) {                         // deadline, not a retry count
+  while (millis() - t0 < UPSTREAM_TIMEOUT_MS) {          // deadline, not a retry count
     int sz = upstreamCli.parsePacket();
     if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
+    const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
     int n = upstreamCli.read(buf, sizeof(buf));
     upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
     if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
@@ -273,6 +310,26 @@ static int forwardUpstream(int qlen, int qend) {
     if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
     buf[0] = cid0; buf[1] = cid1;
     return n;
+  }
+  return 0;
+}
+// Primary first, then the backup if the primary doesn't answer in time. After a primary
+// timeout the backup goes first for a minute, so one dead resolver doesn't add 800 ms to
+// every lookup.
+static int forwardUpstream(int qlen, int qend) {
+  memcpy(qcopy, buf, qlen);
+  const bool haveBackup = (uint32_t)upDns[1] != 0;
+  const bool backupFirst = haveBackup && primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0;
+  if (!backupFirst) primaryDownUntil = 0;
+  const int order[2] = { backupFirst ? 1 : 0, backupFirst ? 0 : 1 };
+  for (int k = 0; k < 2; k++) {
+    const int i = order[k];
+    if ((uint32_t)upDns[i] == 0) continue;
+    if (k) memcpy(buf, qcopy, qlen);                     // the failed try may have left a stray reply in buf
+    int n = askUpstream(upDns[i], qlen, qend);
+    if (n > 0) { upAnswered[i]++; if (i == 0) primaryDownUntil = 0; return n; }
+    upTimeouts[i]++;
+    if (i == 0 && haveBackup) primaryDownUntil = millis() + 60000UL;
   }
   return 0;
 }
@@ -330,6 +387,10 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
+             ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
+             ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
+             ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -440,6 +501,20 @@ static void loadUpdateCfg() {
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
+}
+// ---------- upstream resolver config (/dns.cfg: primary, backup) ----------
+static void loadDnsCfg() {
+  File f = LittleFS.open("/dns.cfg", "r"); if (!f) return;
+  for (int i = 0; i < 2; i++) {
+    String l = f.readStringUntil('\n'); l.trim(); IPAddress ip;
+    if (l.length() && ip.fromString(l)) upDns[i] = ip;
+  }
+  f.close();
+  if ((uint32_t)upDns[0] == 0) upDns[0] = UPSTREAM;
+}
+static void saveDnsCfg() {
+  File f = LittleFS.open("/dns.cfg", "w"); if (!f) return;
+  f.println(upDns[0].toString()); f.println(upDns[1].toString()); f.close();
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
@@ -612,7 +687,7 @@ static void startConfigPortal() {
 
 void setup() {
   Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting");
+  Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION);
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -620,7 +695,7 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
+  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -648,7 +723,12 @@ void setup() {
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() {
+    if (!requireAuth()) return;
+    String d = normDomain(web.arg("d"));
+    if (!d.length()) { web.send(400, "text/plain", "not a domain"); return; }
+    addCustom(d); web.send(200, "text/plain", d);
+  });
   web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
@@ -667,6 +747,22 @@ void setup() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
+  web.on("/setdns", []() {               // /setdns?p=9.9.9.9&b=1.1.1.1  (b empty = no backup, def=1 = defaults)
+    if (!requireAuth()) return;
+    IPAddress p, b;
+    if (web.hasArg("def")) { upDns[0] = UPSTREAM; upDns[1] = UPSTREAM2; }
+    else {
+      String bs = web.arg("b"); bs.trim();
+      if (!p.fromString(web.arg("p")) || (uint32_t)p == 0) { web.send(400, "text/plain", "primary is not an IPv4 address"); return; }
+      if (bs.length() && !b.fromString(bs)) { web.send(400, "text/plain", "backup is not an IPv4 address"); return; }
+      if (p == WiFi.localIP() || (bs.length() && b == WiFi.localIP())) { web.send(400, "text/plain", "that is this device (would loop)"); return; }
+      upDns[0] = p; upDns[1] = bs.length() ? b : IPAddress(0, 0, 0, 0);
+    }
+    primaryDownUntil = 0; upAnswered[0] = upAnswered[1] = upTimeouts[0] = upTimeouts[1] = 0;
+    saveDnsCfg();
+    Serial.printf("[dns] upstream %s, backup %s\n", upDns[0].toString().c_str(), upDns[1].toString().c_str());
+    web.send(200, "text/plain", "ok");
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
