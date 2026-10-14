@@ -113,6 +113,12 @@ un-blocks that exact entry — it can't carve a subdomain out of a blocked paren
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
 
+The output starts with a 16-byte `C3BL` header (format version, entry count, CRC32), so the
+device rejects a truncated or random file instead of loading junk. Older raw files (just the
+hashes) still load. For firmware from before this change, build with `--raw`. The builder also
+drops junk names and subdomains whose parent is already listed, since the device blocks those
+anyway.
+
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
