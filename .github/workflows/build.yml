@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   pull_request:
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: [c3, esp32dev]
+        env: [c3, c3-supermini, esp32dev]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
