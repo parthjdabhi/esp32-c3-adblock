@@ -177,23 +177,45 @@ static bool isBlocked(const char* domain) {
 }
 
 // ---------- persistence ----------
+// Turn what people paste into a bare domain: "https://Max.AppLovin.com/p/x?id=1" ->
+// "max.applovin.com", "*.applovin.com" -> "applovin.com" (a listed domain already covers its
+// subdomains, and the matcher has no wildcards). Returns "" if it isn't a usable domain.
+static String normDomain(String d) {
+  d.trim(); d.toLowerCase();
+  int sch = d.indexOf("://"); if (sch >= 0) d = d.substring(sch + 3);
+  int cut = d.length();
+  for (const char* sep = "/?#:"; *sep; sep++) { int k = d.indexOf(*sep); if (k >= 0 && k < cut) cut = k; }
+  d = d.substring(0, cut);
+  while (d.startsWith("*") || d.startsWith(".")) d = d.substring(1);
+  while (d.endsWith(".")) d.remove(d.length() - 1);
+  if (d.startsWith("www.")) d = d.substring(4);
+  if (d.indexOf('.') <= 0 || d.length() > 253) return "";
+  for (char ch : d) if (!(isalnum((unsigned char)ch) || ch == '.' || ch == '-' || ch == '_')) return "";
+  return d;
+}
+static void saveCustom();
 static void loadCustom() {
+  bool changed = false;
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
-    String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    String raw = f.readStringUntil('\n'); raw.trim();
+    String l = normDomain(raw);
+    bool dup = false; for (int i = 0; i < numCustom; i++) if (customDom[i] == l) dup = true;
+    if (l.length() && !dup) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (raw.length() && (l != raw || dup)) changed = true;   // e.g. an old "*.x.com" entry
   }
   f.close();
+  if (changed) saveCustom();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
 static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  d = normDomain(d);
+  if (!d.length() || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
 static void removeCustom(String d) {
-  d.toLowerCase();
+  d.trim(); d.toLowerCase();
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
     numCustom--; saveCustom(); return;
@@ -648,7 +670,12 @@ void setup() {
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() {
+    if (!requireAuth()) return;
+    String d = normDomain(web.arg("d"));
+    if (!d.length()) { web.send(400, "text/plain", "not a domain"); return; }
+    addCustom(d); web.send(200, "text/plain", d);
+  });
   web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
