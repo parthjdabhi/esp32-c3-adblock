@@ -59,7 +59,7 @@ WebServer web(80);
 File blocklist;
 String blFormat = "none";     // shown on the dashboard
 uint32_t blOffset = 0;          // first hash byte in the file: 16 for a C3BL v1 file, 0 for a raw one
-uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
+uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0, droppedQueries = 0;
 uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
 static uint8_t qcopy[1536];   // the client's query, kept so it can be re-sent to the backup
 
@@ -690,9 +690,14 @@ static void cachePut(uint64_t key, int n, int qend, bool edns) {
 }
 
 // Answer the query in buf (qlen bytes) for client c. Returns the reply length in buf (0 = none).
+// Drops anything that isn't a plain standard query (idea from upstream PR #26): replies
+// (QR set, e.g. a reflected packet), other opcodes, not exactly one question, or a class
+// other than IN (CHAOS "version.bind" probes etc.). Those are never forwarded.
 static int answerQuery(int qlen, Dev* c) {
+  if (qlen < 17 || (buf[2] & 0x80) || ((buf[2] >> 3) & 0x0F) != 0 || buf[4] != 0 || buf[5] != 1) { droppedQueries++; return 0; }
   char domain[256]; uint16_t qtype = 0; int qend = qlen;
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  if (dl && (buf[qend - 2] != 0 || buf[qend - 1] != 1)) { droppedQueries++; return 0; }
   if (dl) hintFromQuery(c, domain);
   bool ban = c && c->banned;
   bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
@@ -799,7 +804,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"blformat\":\"" + jesc(blFormat) + "\",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
+             ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"blformat\":\"" + jesc(blFormat) + "\",\"dropped\":" + String(droppedQueries) + ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
              ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
@@ -834,9 +839,39 @@ static void handleStats() {
 // drive-by case without needing TLS, cookies, or a token endpoint.
 static const char* CSRF_HEADER = "X-Requested-With";
 static const char* CSRF_VALUE  = "c3-adblock";
+// Password-guessing lockout (idea from upstream PR #27): per client IP, 5 wrong passwords
+// lock it out for 30 s, 10 or more for 5 min. A request without credentials (the browser's
+// first try, before it shows the login box) doesn't count as a failure.
+struct AuthFail { uint32_t ip; uint8_t fails; uint32_t until; };
+static AuthFail authFails[8];
+static AuthFail* authSlot(uint32_t ip, bool create) {
+  AuthFail* old = &authFails[0];
+  for (auto& a : authFails) { if (a.ip == ip) return &a; if ((int32_t)(a.until - old->until) < 0) old = &a; }
+  if (!create) return nullptr;
+  old->ip = ip; old->fails = 0; old->until = 0; return old;
+}
+static bool authLocked() {
+  AuthFail* a = authSlot((uint32_t)web.client().remoteIP(), false);
+  return a && a->until && (int32_t)(a->until - millis()) > 0;
+}
+// true = good credentials. Wrong ones are counted; a locked-out IP is refused without checking.
+static bool checkCredentials() {
+  if (authLocked()) return false;
+  const uint32_t ip = (uint32_t)web.client().remoteIP();
+  if (web.authenticate(WEB_USER, WEB_PASS)) { AuthFail* a = authSlot(ip, false); if (a) a->fails = 0; return true; }
+  if (web.hasHeader("Authorization")) {
+    AuthFail* a = authSlot(ip, true);
+    if (a->fails < 255) a->fails++;
+    if (a->fails >= 10) a->until = millis() + 300000UL;
+    else if (a->fails >= 5) a->until = millis() + 30000UL;
+    if (a->fails >= 5) Serial.printf("[auth] %s locked out after %u wrong passwords\n", IPAddress(ip).toString().c_str(), a->fails);
+  }
+  return false;
+}
 static bool requireAuth() {
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
-  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  if (authLocked()) { web.send(429, "text/plain", "too many wrong passwords, try again later"); return false; }
+  if (checkCredentials()) return true;
   web.requestAuthentication();
   return false;
 }
@@ -927,7 +962,7 @@ static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
-      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && checkCredentials();
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
       upFile = LittleFS.open("/blocklist.new", "w");
@@ -1015,7 +1050,7 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && checkCredentials();
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
