@@ -60,7 +60,7 @@ cp src/secrets.example.h src/secrets.h
 #    src/secrets.hのWIFI_SSIDとWIFI_PASSを編集します。
 
 # 2. ブロックリストのハッシュ表を作成します。
-#    初期設定はStevenBlack base + Hagezi Lightで、約14万ドメインです。
+#    初期設定はStevenBlack base + AdGuard DNS filterで、約23万ドメインです。
 #    WhatsAppおよびSNSへの影響を避ける構成です。
 python3 tools/build_blocklist.py data/blocklist.bin
 

@@ -80,8 +80,8 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h
 
-# 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
-#    ~100k entries, WhatsApp/social safe)
+# 2. build the blocklist hash table (default = StevenBlack base + AdGuard DNS filter,
+#    ~230k entries, WhatsApp/social safe)
 python3 tools/build_blocklist.py data/blocklist.bin
 
 # 3. flash firmware + the blocklist filesystem (the one and only USB flash)
