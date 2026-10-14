@@ -57,6 +57,8 @@ static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
+String blFormat = "none";     // shown on the dashboard
+uint32_t blOffset = 0;          // first hash byte in the file: 16 for a C3BL v1 file, 0 for a raw one
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
 static uint8_t qcopy[1536];   // the client's query, kept so it can be re-sent to the backup
@@ -117,7 +119,7 @@ static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
-    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.seek(blOffset + (uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
@@ -149,7 +151,7 @@ static bool inFlash(uint64_t h) {
   uint32_t rangeCount = endPos - startPos + 1;
   if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
 
-  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.seek(blOffset + (uint32_t)startPos * HASH_BYTES);
   blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
 
   for (uint32_t i = 0; i < rangeCount; i++) {
@@ -595,7 +597,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
+             ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"blformat\":\"" + jesc(blFormat) + "\",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
              ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
@@ -644,9 +646,50 @@ static void handleBan() {
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
 // The partition holds one list, so we free the old one before writing the new.
 // While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// Blocklist file formats (issue #20):
+//   v1  "C3BL" | version 1 | hash bytes | 0 0 | count (LE32) | CRC32 of hashes (LE32) | hashes
+//   raw just the sorted hashes (older builds). Still accepted, but can't be checked.
+// A raw file is always a multiple of 5 bytes and a v1 file never is (16 + 5n), so the two
+// can't be confused. A v1 file that fails any check is rejected: no list = no blocking.
+static const uint32_t BL_HDR = 16;
+static uint32_t crc32Update(uint32_t crc, const uint8_t* p, size_t n) {   // same as zlib.crc32
+  crc = ~crc;
+  while (n--) { crc ^= *p++; for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1))); }
+  return ~crc;
+}
+// Returns the number of hashes (0 = unusable) and sets the payload offset. *why gets a reason.
+static uint32_t checkBlocklist(File& f, uint32_t* off, const char** why) {
+  *off = 0; *why = "empty";
+  if (!f) { *why = "missing"; return 0; }
+  const size_t sz = f.size();
+  uint8_t h[BL_HDR];
+  f.seek(0);
+  if (sz >= BL_HDR && f.read(h, BL_HDR) == BL_HDR && !memcmp(h, "C3BL", 4)) {
+    if (h[4] != 1)          { *why = "unknown format version"; return 0; }
+    if (h[5] != HASH_BYTES) { *why = "wrong hash size"; return 0; }
+    uint32_t n   = h[8] | (h[9] << 8) | (h[10] << 16) | ((uint32_t)h[11] << 24);
+    uint32_t crc = h[12] | (h[13] << 8) | (h[14] << 16) | ((uint32_t)h[15] << 24);
+    if (!n || (uint64_t)BL_HDR + (uint64_t)n * HASH_BYTES != sz) { *why = "size does not match header (truncated?)"; return 0; }
+    uint32_t c = 0; uint8_t chunk[512]; size_t left = sz - BL_HDR;
+    while (left) { size_t want = left > sizeof(chunk) ? sizeof(chunk) : left;
+      if (f.read(chunk, want) != want) { *why = "read error"; return 0; }
+      c = crc32Update(c, chunk, want); left -= want; }
+    if (c != crc) { *why = "CRC mismatch (corrupt file)"; return 0; }
+    *off = BL_HDR; *why = "ok (v1, CRC checked)"; return n;
+  }
+  if (sz && sz % HASH_BYTES == 0) { *why = "ok (raw, unchecked)"; return sz / HASH_BYTES; }
+  *why = "not a blocklist (bad size, no C3BL header)";
+  return 0;
+}
+// ---------- blocklist swap (shared by upload + remote fetch) ----------
+// The partition holds one list, so we free the old one before writing the new.
+// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  const char* why; numHashes = checkBlocklist(blocklist, &blOffset, &why);
+  blFormat = why;
+  Serial.printf("blocklist: %u domains, %s\n", numHashes, why);
   buildFlashIndex();
 }
 static void beginBlocklistSwap() {
@@ -655,10 +698,13 @@ static void beginBlocklistSwap() {
   LittleFS.remove(BLOCKLIST_PATH);
   LittleFS.remove("/blocklist.new");
 }
+static String lastReject = "";
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
+  uint32_t off; const char* why;
+  bool ok = checkBlocklist(f, &off, &why) > 0;
+  if (f) f.close();
+  lastReject = ok ? "" : why;
   if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
   else    LittleFS.remove("/blocklist.new");
   reopenBlocklist();
@@ -672,7 +718,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: " + lastReject);
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -750,7 +796,7 @@ static bool fetchBlocklist(String url) {
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B): " + lastReject);
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
@@ -900,12 +946,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION);
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();
   loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg(); loadNames();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 

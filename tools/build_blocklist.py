@@ -6,7 +6,10 @@ device, so no PSRAM is needed.
 HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
 
-Usage: build_blocklist.py [out.bin] [src ...]
+Usage: build_blocklist.py [--raw] [out.bin] [src ...]
+  Output is a "C3BL" v1 file: 16-byte header (magic, version, hash size, count, CRC32)
+  + the sorted hashes, so the device can reject a corrupt or random file. --raw writes
+  just the hashes, for firmware older than the header change.
   src = local file or URL. With none given, downloads a balanced daily-driver set
   (StevenBlack base + AdGuard DNS filter) ~= 230k entries: blocks ads/trackers/malware
   but leaves WhatsApp/Instagram/social/messaging working.
@@ -17,7 +20,7 @@ Usage: build_blocklist.py [out.bin] [src ...]
       https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
 """
 import re
-import sys, os, math, urllib.request
+import sys, os, math, struct, urllib.request, zlib
 
 HASH_BYTES = 5                          # 40-bit hashes -- must match firmware
 MASK = (1 << (HASH_BYTES * 8)) - 1
@@ -66,6 +69,10 @@ def norm(d: str) -> str:
     d = d.strip().lower().lstrip('*').lstrip('.').rstrip('.')
     return d[4:] if d.startswith('www.') else d
 
+def container_header(count: int, payload: bytes) -> bytes:
+    """C3BL v1 header -- must match checkBlocklist() in src/main.cpp."""
+    return b'C3BL' + struct.pack('<BBHII', 1, HASH_BYTES, 0, count, zlib.crc32(payload) & 0xFFFFFFFF)
+
 def read_source(src: str) -> str:
     if os.path.exists(src):
         return open(src, errors='ignore').read()
@@ -74,8 +81,9 @@ def read_source(src: str) -> str:
 
 def main():
     global ALLOW_MISSING
-    args = [a for a in sys.argv[1:] if a != '--allow-missing']
+    args = [a for a in sys.argv[1:] if a not in ('--allow-missing', '--raw')]
     ALLOW_MISSING = '--allow-missing' in sys.argv[1:]
+    raw = '--raw' in sys.argv[1:]
     out = args[0] if args else 'blocklist.bin'
     sources = args[1:] if len(args) > 1 else DEFAULT_SOURCES
 
@@ -129,11 +137,13 @@ def main():
     hashes = sorted(fnv(d.encode()) for d in domains)
     collisions = len(hashes) - len(set(hashes))
     uniq = sorted(set(hashes))                       # one entry per distinct hash
+    payload = b''.join(h.to_bytes(HASH_BYTES, 'little') for h in uniq)
     with open(out, 'wb') as f:
-        for h in uniq:
-            f.write(h.to_bytes(HASH_BYTES, 'little'))
+        if not raw:
+            f.write(container_header(len(uniq), payload))
+        f.write(payload)
 
-    n, size = len(uniq), len(uniq) * HASH_BYTES
+    n, size = len(uniq), os.path.getsize(out)
     print(f'source domains   : {len(domains):,}')
     print(f'hash entries     : {n:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')

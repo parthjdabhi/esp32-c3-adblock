@@ -20,26 +20,31 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build default blocklist (fails if any source is unreachable)
-        run: python3 tools/build_blocklist.py blocklist.bin 2>&1 | tee build.log
+        run: |
+          python3 tools/build_blocklist.py blocklist.bin 2>&1 | tee build.log
+          # headerless copy for firmware older than the C3BL header (same domains)
+          tail -c +17 blocklist.bin > blocklist-raw.bin
       - name: Sanity checks
         run: |
           size=$(stat -c%s blocklist.bin)
           echo "size=$size bytes"
-          test $((size % 5)) -eq 0                  # whole 40-bit entries
+          test "$(head -c 4 blocklist.bin)" = C3BL   # v1 header present
+          test $(((size - 16) % 5)) -eq 0           # whole 40-bit entries after the header
           test "$size" -gt 250000                   # >50k entries, catches a silently shrunk list
           test "$size" -lt 1300000                  # fits the dual-OTA filesystem partition
       - name: Publish to the 'blocklist' release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          entries=$(( $(stat -c%s blocklist.bin) / 5 ))
+          entries=$(( ($(stat -c%s blocklist.bin) - 16) / 5 ))
           notes="Auto-built $(date -u +%F) - ${entries} entries (StevenBlack base + AdGuard DNS filter).
 
           Set this as the device's Remote auto-update URL:
-          https://github.com/${{ github.repository }}/releases/download/blocklist/blocklist.bin"
+          https://github.com/${{ github.repository }}/releases/download/blocklist/blocklist.bin
+          (older firmware without the C3BL header check: blocklist-raw.bin)"
           if gh release view blocklist >/dev/null 2>&1; then
             gh release edit blocklist --notes "$notes"
           else
             gh release create blocklist --title "Weekly blocklist" --notes "$notes" --latest=false
           fi
-          gh release upload blocklist blocklist.bin --clobber
+          gh release upload blocklist blocklist.bin blocklist-raw.bin --clobber
