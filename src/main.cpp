@@ -17,6 +17,8 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/sockets.h"
+#include "esp_netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -71,7 +73,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; bool v6; uint8_t ip6[16]; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -257,13 +259,22 @@ static void getMac(uint32_t ip, uint8_t* mac) {
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
 static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
+  for (int i = 0; i < numClients; i++) if (!clients[i].v6 && clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->v6 = false; c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
     getMac(ip, c->mac); return c;
   }
   return nullptr;
+}
+// IPv6 clients get their own rows (shown by address; ban is IPv4 only).
+static Dev* getClient6(const uint8_t* a) {
+  for (int i = 0; i < numClients; i++) if (clients[i].v6 && !memcmp(clients[i].ip6, a, 16)) { clients[i].lastSeen = millis(); return &clients[i]; }
+  if (numClients >= MAX_CLIENTS) return nullptr;
+  Dev* c = &clients[numClients++];
+  c->v6 = true; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
+  memset(c->mac, 0, 6);
+  return c;
 }
 
 // ---------- DNS ----------
@@ -430,6 +441,43 @@ static void cachePut(uint64_t key, int n, int qend, bool edns) {
   memcpy(slot->data, buf, n);
 }
 
+// Answer the query in buf (qlen bytes) for client c. Returns the reply length in buf (0 = none).
+static int answerQuery(int qlen, Dev* c) {
+  char domain[256]; uint16_t qtype = 0; int qend = qlen;
+  size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  bool ban = c && c->banned;
+  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+  int rlen;
+  if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+  else {
+    const bool cacheable = dl && qend <= qlen && ((buf[4] << 8) | buf[5]) == 1;
+    const uint64_t key = cacheable ? answerKey(qend) : 0;
+    const bool edns = (buf[10] | buf[11]) != 0;
+    rlen = cacheable ? cacheGet(key, qend) : 0;
+    if (!rlen) { rlen = forwardUpstream(qlen, qend); if (rlen > 0 && cacheable) cachePut(key, rlen, qend, edns); }
+    totalAllowed++; if (c) c->allowed++;
+  }
+  return rlen;
+}
+
+// IPv6 DNS: a second socket on [::]:53 (IPv6 only, the IPv4 one stays as it is). Lets the
+// router hand out this device as the IPv6 DNS too, so IPv6 lookups can't skip the blocker.
+// Disable with -DNO_IPV6_DNS.
+static int dns6 = -1;
+uint32_t queries6 = 0;
+static void startDns6() {
+#ifndef NO_IPV6_DNS
+  dns6 = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (dns6 < 0) { Serial.println("[dns6] socket failed"); return; }
+  int one = 1; setsockopt(dns6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+  struct sockaddr_in6 a; memset(&a, 0, sizeof(a));
+  a.sin6_family = AF_INET6; a.sin6_port = htons(DNS_PORT); a.sin6_addr = in6addr_any;
+  if (bind(dns6, (struct sockaddr*)&a, sizeof(a)) < 0) { Serial.printf("[dns6] bind failed: %d\n", errno); close(dns6); dns6 = -1; return; }
+  fcntl(dns6, F_SETFL, fcntl(dns6, F_GETFL, 0) | O_NONBLOCK);
+  Serial.println("[dns6] listening on [::]:53");
+#endif
+}
+
 // Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
@@ -439,24 +487,34 @@ static bool handleDns() {
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
     int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
-    char domain[256]; uint16_t qtype = 0; int qend = qlen;
-    size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
-    bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else {
-      const bool cacheable = dl && qend <= qlen && ((buf[4] << 8) | buf[5]) == 1;
-      const uint64_t key = cacheable ? answerKey(qend) : 0;
-      const bool edns = (buf[10] | buf[11]) != 0;
-      rlen = cacheable ? cacheGet(key, qend) : 0;
-      if (!rlen) { rlen = forwardUpstream(qlen, qend); if (rlen > 0 && cacheable) cachePut(key, rlen, qend, edns); }
-      totalAllowed++; if (c) c->allowed++;
-    }
+    int rlen = answerQuery(qlen, getClient((uint32_t)cip));
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
   }
+  for (int budget = 0; dns6 >= 0 && budget < 16; budget++) {
+    struct sockaddr_in6 from; socklen_t fl = sizeof(from);
+    int qlen = recvfrom(dns6, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fl);
+    if (qlen <= 0) break;
+    did = true;
+    if (qlen < 13) continue;
+    queries6++;
+    int rlen = answerQuery(qlen, getClient6(from.sin6_addr.s6_addr));
+    if (rlen > 0) sendto(dns6, buf, rlen, 0, (struct sockaddr*)&from, fl);
+  }
   return did;
+}
+
+// This device's IPv6 addresses (link-local + any SLAAC global), for the dashboard.
+static String ip6List() {
+  String o;
+  esp_netif_t* nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!nif) return o;
+  esp_ip6_addr_t addrs[LWIP_IPV6_NUM_ADDRESSES];
+  int n = esp_netif_get_all_ip6(nif, addrs);
+  for (int i = 0; i < n; i++) {
+    char t[48]; ip6addr_ntoa_r((const ip6_addr_t*)&addrs[i], t, sizeof(t));
+    o += (o.length() ? ",\"" : "\""); o += t; o += "\"";
+  }
+  return o;
 }
 
 // ---------- web ----------
@@ -491,7 +549,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
+             ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
              ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
@@ -501,7 +559,8 @@ static void handleStats() {
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    char t6[48] = ""; if (c.v6) ip6addr_ntoa_r((const ip6_addr_t*)c.ip6, t6, sizeof(t6));
+    j += (i ? "," : ""); j += "{\"ip\":\"" + (c.v6 ? String(t6) : ip.toString()) + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
@@ -823,6 +882,11 @@ void setup() {
                     "device on a network you don't fully control.");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+#ifndef NO_IPV6_DNS
+  WiFi.enableIpV6();                                      // link-local now; SLAAC global from router RAs
+  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { WiFi.enableIpV6(); }, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  startDns6();
+#endif
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);

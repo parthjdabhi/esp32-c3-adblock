@@ -41,6 +41,9 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/&lt;env&gt;/firmware.bin</code> (env = c3, c3-supermini or esp32dev) &mdash; device verifies it and reboots into it. running: <code id=fwver>&mdash;</code></div>
+<h2>IPV6 DNS</h2>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">this device also answers DNS over IPv6 at <code id=ip6>&mdash;</code> (<span id=q6>0</span> IPv6 queries).
+If your router hands out its own IPv6 DNS, devices can skip the blocker: in the router, set IPv6 DNS to one of these addresses (or leave it empty). Prefer the <code>fe80::</code> one, it never changes.</div>
 <h2>UPSTREAM DNS</h2>
 <div style=margin-bottom:6px>primary <input id=dns1 placeholder="9.9.9.9" size=15> backup <input id=dns2 placeholder="none" size=15>
 <button onclick=saveDns()>Save</button> <button onclick=defDns()>Defaults</button></div>
@@ -71,7 +74,8 @@ sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allow
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+<td>${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
+ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
