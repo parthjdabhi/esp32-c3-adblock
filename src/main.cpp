@@ -54,7 +54,7 @@ static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
-WiFiUDP dnsServer, upstreamCli;
+WiFiUDP dnsServer, upstreamCli, dhcpSniff, nbUdp;
 WebServer web(80);
 File blocklist;
 String blFormat = "none";     // shown on the dashboard
@@ -75,7 +75,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; bool v6; uint8_t ip6[16]; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; bool v6; alignas(4) uint8_t ip6[16]; const char* hint; uint32_t nbAskedMs; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -264,7 +264,7 @@ static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (!clients[i].v6 && clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->v6 = false; c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->v6 = false; c->hint = nullptr; c->nbAskedMs = 0; c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
     getMac(ip, c->mac); return c;
   }
   return nullptr;
@@ -274,7 +274,7 @@ static Dev* getClient6(const uint8_t* a) {
   for (int i = 0; i < numClients; i++) if (clients[i].v6 && !memcmp(clients[i].ip6, a, 16)) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients >= MAX_CLIENTS) return nullptr;
   Dev* c = &clients[numClients++];
-  c->v6 = true; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
+  c->v6 = true; c->hint = nullptr; c->nbAskedMs = 0; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
   memset(c->mac, 0, 6);
   return c;
 }
@@ -326,6 +326,148 @@ static bool setName(String key, String alt, String name) {
   if (changed) saveNames();
   return true;
 }
+// ---------- automatic device names ----------
+// The device only sees DNS, so names come from what clients announce on the LAN:
+//  - DHCP: a joining device broadcasts its hostname (option 12) and often a vendor class
+//    (option 60, e.g. "android-dhcp-14", "MSFT 5.0"). We listen on UDP 67 (we're not the
+//    DHCP server, the router answers) and remember the hostname by MAC in /auto.txt.
+//  - NetBIOS: Windows PCs answer a node-status query on UDP 137 with their computer name.
+//  - DNS hints: which vendor domains a client looks up ("Apple", "Android", ...).
+// A name typed on the dashboard always wins over these.
+static String macStr(const uint8_t* m);
+static const int MAX_AUTO = 48;
+struct AutoName { uint8_t mac[6]; char host[33]; char vend[25]; };
+static AutoName autoNames[MAX_AUTO]; static int numAuto = 0;
+static void saveAuto() {
+  File f = LittleFS.open("/auto.txt", "w"); if (!f) return;
+  for (int i = 0; i < numAuto; i++) f.printf("%02x%02x%02x%02x%02x%02x\t%s\t%s\n", autoNames[i].mac[0], autoNames[i].mac[1],
+    autoNames[i].mac[2], autoNames[i].mac[3], autoNames[i].mac[4], autoNames[i].mac[5], autoNames[i].host, autoNames[i].vend);
+  f.close();
+}
+// Copy only safe characters (letters, digits, - _ . space), so names are safe in JSON/HTML.
+static void cleanCopy(char* dst, size_t cap, const uint8_t* src, size_t n) {
+  size_t o = 0;
+  for (size_t i = 0; i < n && o + 1 < cap; i++) {
+    char ch = (char)src[i];
+    if (ch == 0) break;
+    if (isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.' || ch == ' ') dst[o++] = ch;
+  }
+  dst[o] = 0;
+}
+static AutoName* autoFor(const uint8_t* mac, bool create) {
+  for (int i = 0; i < numAuto; i++) if (!memcmp(autoNames[i].mac, mac, 6)) return &autoNames[i];
+  if (!create) return nullptr;
+  AutoName* a = numAuto < MAX_AUTO ? &autoNames[numAuto++] : &autoNames[esp_random() % MAX_AUTO];
+  memcpy(a->mac, mac, 6); a->host[0] = a->vend[0] = 0;
+  return a;
+}
+// Store a learned name; returns true if anything changed (caller saves).
+static bool learnName(const uint8_t* mac, const char* host, const char* vend) {
+  if (macZero(mac)) return false;
+  AutoName* a = autoFor(mac, false);
+  if (a && (!host[0] || !strcmp(a->host, host)) && (!vend[0] || !strcmp(a->vend, vend))) return false;
+  if (!a) a = autoFor(mac, true);
+  if (host[0]) strlcpy(a->host, host, sizeof(a->host));
+  if (vend[0]) strlcpy(a->vend, vend, sizeof(a->vend));
+  return true;
+}
+static void loadAuto() {
+  numAuto = 0; File f = LittleFS.open("/auto.txt", "r"); if (!f) return;
+  while (f.available() && numAuto < MAX_AUTO) {
+    String l = f.readStringUntil('\n'); int t1 = l.indexOf('\t'); if (t1 != 12) continue;
+    int t2 = l.indexOf('\t', t1 + 1); if (t2 < 0) t2 = l.length();
+    AutoName& a = autoNames[numAuto];
+    for (int k = 0; k < 6; k++) a.mac[k] = (uint8_t)strtoul(l.substring(k * 2, k * 2 + 2).c_str(), nullptr, 16);
+    String h = l.substring(t1 + 1, t2), v = t2 < (int)l.length() ? l.substring(t2 + 1) : ""; v.trim();
+    cleanCopy(a.host, sizeof(a.host), (const uint8_t*)h.c_str(), h.length());
+    cleanCopy(a.vend, sizeof(a.vend), (const uint8_t*)v.c_str(), v.length());
+    numAuto++;
+  }
+  f.close();
+}
+static void handleDhcpSniff() {
+  static uint8_t p[600];
+  for (int budget = 0; budget < 4; budget++) {
+    int sz = dhcpSniff.parsePacket(); if (sz <= 0) return;
+    int n = dhcpSniff.read(p, sizeof(p)); dhcpSniff.flush();
+    if (n < 244 || p[0] != 1 || p[1] != 1 || p[2] != 6) continue;          // BOOTREQUEST, Ethernet
+    if (p[236] != 0x63 || p[237] != 0x82 || p[238] != 0x53 || p[239] != 0x63) continue;
+    char host[33] = "", vend[25] = "";
+    for (int i = 240; i < n; ) {
+      uint8_t op = p[i++]; if (op == 255) break; if (op == 0) continue;
+      if (i >= n) break; uint8_t len = p[i++]; if (i + len > n) break;
+      if (op == 12) cleanCopy(host, sizeof(host), p + i, len);
+      if (op == 60) cleanCopy(vend, sizeof(vend), p + i, len);
+      i += len;
+    }
+    if ((host[0] || vend[0]) && learnName(p + 28, host, vend)) {
+      Serial.printf("[names] dhcp %s %s (%s)\n", macStr(p + 28).c_str(), host, vend);
+      saveAuto();
+    }
+  }
+}
+// NetBIOS node status ("what's your name?") to IPv4 clients we have no name for:
+// one query every 2 s at most, and each client at most every 10 minutes.
+static void askNetbios() {
+  static uint32_t last = 0; if (millis() - last < 2000) return; last = millis();
+  static const uint8_t q[] = { 0x4e, 0x42, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
+    'C','K','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
+    0x00, 0x00, 0x21, 0x00, 0x01 };
+  for (int i = 0; i < numClients; i++) {
+    Dev& c = clients[i];
+    if (c.v6 || macZero(c.mac)) continue;
+    AutoName* a = autoFor(c.mac, false); if (a && a->host[0]) continue;
+    if (c.nbAskedMs && millis() - c.nbAskedMs < 600000UL) continue;
+    c.nbAskedMs = millis() | 1;
+    nbUdp.beginPacket(IPAddress(c.ip), 137); nbUdp.write(q, sizeof(q)); nbUdp.endPacket();
+    return;
+  }
+}
+static void handleNetbios() {
+  static uint8_t p[600];
+  int sz = nbUdp.parsePacket(); if (sz <= 0) return;
+  uint32_t from = (uint32_t)nbUdp.remoteIP();
+  int n = nbUdp.read(p, sizeof(p)); nbUdp.flush();
+  if (n < 57 + 18 || p[0] != 0x4e || p[1] != 0x42 || !(p[2] & 0x80)) return;
+  int count = p[56];
+  for (int k = 0; k < count && 57 + (k + 1) * 18 <= n; k++) {
+    const uint8_t* e = p + 57 + k * 18;
+    if (e[15] != 0x00 || (e[16] & 0x80)) continue;        // workstation name, not a group name
+    char host[33]; cleanCopy(host, sizeof(host), e, 15);
+    for (int t = (int)strlen(host) - 1; t >= 0 && host[t] == ' '; t--) host[t] = 0;
+    if (!host[0]) return;
+    for (int i = 0; i < numClients; i++) if (!clients[i].v6 && clients[i].ip == from)
+      if (learnName(clients[i].mac, host, "")) { Serial.printf("[names] netbios %s\n", host); saveAuto(); }
+    return;
+  }
+}
+// Guess the device type from vendor domains it looks up. First match sticks.
+static void hintFromQuery(Dev* c, const char* d) {
+  if (!c || c->hint) return;
+  static const char* const pat[][2] = {
+    {"apple.com", "Apple"}, {"icloud.com", "Apple"}, {"mzstatic.com", "Apple"},
+    {"samsung", "Samsung"}, {"xiaomi", "Xiaomi"}, {"miui.com", "Xiaomi"}, {"oppomobile", "Oppo"}, {"vivo.com", "Vivo"},
+    {"heytapmobi", "Oppo/Realme"}, {"hicloud.com", "Huawei"}, {"oneplus", "OnePlus"},
+    {"windowsupdate", "Windows"}, {"msftconnecttest", "Windows"}, {"msftncsi", "Windows"},
+    {"connectivitycheck.gstatic.com", "Android"}, {"connectivitycheck.android.com", "Android"}, {"android.clients.google.com", "Android"},
+    {"roku.com", "Roku"}, {"lgtvsdp", "LG TV"}, {"lgsmartad", "LG TV"}, {"tizen", "Samsung TV"},
+    {"hik-connect", "Hikvision"}, {"hikvision", "Hikvision"}, {"ezvizlife", "Ezviz"}, {"star4live", "Uniview"}, {"uniview", "Uniview"},
+    {"tplinkcloud", "TP-Link"}, {"tuya", "Tuya IoT"}, {"amazon-dss", "Amazon/Alexa"}, {"ubuntu.com", "Linux"},
+  };
+  for (auto& pr : pat) if (strstr(d, pr[0])) { c->hint = pr[1]; return; }
+}
+static String autoHost(const Dev& c) { const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false); return a ? String(a->host) : String(""); }
+static String autoHint(const Dev& c) {
+  if (c.hint) return c.hint;
+  const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false);
+  if (a && a->vend[0]) {
+    if (!strncmp(a->vend, "android", 7)) return "Android";
+    if (!strncmp(a->vend, "MSFT", 4)) return "Windows";
+    return a->vend;
+  }
+  return "";
+}
+
 static String nameOf(const String& mac, const String& ip) {
   for (int i = 0; i < numNames; i++) if (nameKey[i] == mac || nameKey[i] == ip) return nameVal[i];
   return "";
@@ -501,6 +643,7 @@ static void cachePut(uint64_t key, int n, int qend, bool edns) {
 static int answerQuery(int qlen, Dev* c) {
   char domain[256]; uint16_t qtype = 0; int qend = qlen;
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  if (dl) hintFromQuery(c, domain);
   bool ban = c && c->banned;
   bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
   int rlen;
@@ -620,7 +763,7 @@ static void handleStats() {
     if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); ip6addr_ntoa_r(&a6, t6, sizeof(t6)); }
     String ips = c.v6 ? String(t6) : ip.toString(), ms = macStr(c.mac);
     String key = macZero(c.mac) ? ips : ms;
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"auto\":\"" + jesc(autoHost(c)) + "\",\"hint\":\"" + jesc(autoHint(c)) + "\",\"priv\":" + ((!c.v6 && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
@@ -957,7 +1100,7 @@ void setup() {
   Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION);
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   reopenBlocklist();
-  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg(); loadNames();
+  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg(); loadNames(); loadAuto();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -983,6 +1126,7 @@ void setup() {
   acache = (CachedAnswer (*)[AC_WAYS])calloc(AC_SETS, sizeof(CachedAnswer[AC_WAYS]));
   if (!acache) Serial.println("[cache] no RAM, answer cache off");
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dhcpSniff.begin(67); nbUdp.begin(0);           // automatic device names (see handleDhcpSniff)
 #ifndef NO_IPV6_DNS
   WiFi.enableIpV6();                                      // link-local now; SLAAC global from router RAs
   WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { WiFi.enableIpV6(); }, ARDUINO_EVENT_WIFI_STA_CONNECTED);
@@ -1048,6 +1192,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  handleDhcpSniff(); handleNetbios(); askNetbios();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
