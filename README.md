@@ -140,6 +140,33 @@ build_flags = ${env:c3.build_flags}
 
 With a static IP the board only works on that network; rebuild without the flags to move it.
 
+## Ads still showing? Check these first
+
+DNS blocking only works if every lookup goes through the device. The common leaks:
+
+- **IPv6 DNS from the router.** Many ISP routers hand out their own IPv6 DNS next to (often
+  before) the ESP32, so devices can skip the blocker. Check the device's DNS list
+  (`ipconfig /all` on Windows, `scutil --dns` on macOS, Wi-Fi details on phones). If you see
+  an IPv6 server that isn't the ESP32, in the router's IPv6 / LAN settings either:
+  - set IPv6 DNS to static and point it at the ESP32's IPv6 address (shown on the dashboard
+    under *IPv6 DNS*, prefer the `fe80::` one), or
+  - set it to static with the fields empty, so only the IPv4 DNS (the ESP32) is handed out.
+
+  Don't disable IPv6 on the router as a whole: on some ISP connections that breaks the internet.
+- **Browser Secure DNS / DoH.** Chrome, Edge and Firefox can send lookups over HTTPS to their
+  own resolver. Turn *Use secure DNS* off, or set it to "your current provider".
+- **iCloud Private Relay / Android Private DNS.** Both bypass the network DNS. Turn them off for
+  this network.
+- **Cached answers.** After changing anything, flush caches: `chrome://net-internals/#dns`
+  (Clear host cache), `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` on
+  macOS, `ipconfig /flushdns` on Windows, or toggle Wi-Fi on phones.
+- **Test the browser, not just nslookup.** `nslookup ads.example.com <esp32-ip>` only proves
+  the device blocks it. Check `chrome://net-internals/#dns` to see what the browser actually
+  resolved.
+
+Some ads can't be blocked by DNS at all: YouTube, Instagram and other first-party ads come
+from the same domains as the content.
+
 ## Over-the-air updates (no more USB)
 
 The dashboard at **http://c3adblock.local** does it all:
@@ -241,6 +268,11 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
 - ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
+- ✅ Device names in the clients table (saved by MAC), MACs filled in once ARP knows them
+- ✅ Upstream DNS primary + backup, set from the dashboard (default Quad9)
+- ✅ RAM answer cache for allowed lookups (TTL aware), so bursts are answered fast
+- ✅ DNS over IPv6 (link-local + SLAAC), so the router's IPv6 DNS can point at the device
+- ✅ `C3BL` blocklist header with CRC32, a corrupt or random upload is rejected
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
