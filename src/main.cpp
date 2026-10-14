@@ -333,6 +333,103 @@ static int forwardUpstream(int qlen, int qend) {
   }
   return 0;
 }
+// ---------- answer cache (allowed lookups only) ----------
+// Pages fire bursts of the same lookups. Answering repeats from RAM instead of waiting on
+// the upstream keeps the device fast, so clients don't give up and fall back to another
+// DNS server on their list (issue #40). Blocked names never get here: the block check runs
+// first, so adding a custom block takes effect at once. 4-way sets, oldest entry evicted.
+static const int AC_SETS = 16, AC_WAYS = 4, AC_MAX = 512;   // 64 answers, ~33 KB
+static const uint32_t AC_MAX_TTL = 3600, AC_EMPTY_TTL = 60;
+struct CachedAnswer { uint64_t key; uint32_t storedMs, ttl; uint16_t len, qend; bool edns; uint8_t data[AC_MAX]; };
+static CachedAnswer acache[AC_SETS][AC_WAYS];
+uint32_t cacheHits = 0;
+static uint64_t acSeed = 0;                     // random per boot, so set placement can't be precomputed
+
+// The key only picks the set and speeds up the compare. A hit also needs the stored
+// question to match exactly (case-insensitive), so a hash collision can't serve the answer
+// for a different name.
+static uint64_t answerKey(int qend) {          // question bytes (case-folded) + "has EDNS"
+  if (!acSeed) acSeed = ((uint64_t)esp_random() << 32) | esp_random() | 1;
+  uint64_t h = 0xcbf29ce484222325ULL ^ acSeed;
+  for (int i = 12; i < qend; i++) { h ^= (uint8_t)tolower(buf[i]); h *= 0x100000001b3ULL; }
+  h ^= (buf[10] | buf[11]) ? 1 : 0; h *= 0x100000001b3ULL;
+  return h | 1;                                 // 0 marks an empty slot
+}
+static int skipName(const uint8_t* m, int n, int i) {
+  while (i < n) {
+    uint8_t l = m[i];
+    if ((l & 0xC0) == 0xC0) return i + 2 <= n ? i + 2 : -1;
+    if (l & 0xC0) return -1;
+    i += 1 + l; if (l == 0) return i;
+  }
+  return -1;
+}
+// Walk every resource record. Finds the smallest TTL, and if age > 0 also lowers each TTL
+// by age (never below 1). The EDNS OPT record (type 41) uses the TTL field for flags: skipped.
+static bool walkTtls(uint8_t* m, int n, uint32_t* minTtl, uint32_t age) {
+  if (n < 12 || ((m[4] << 8) | m[5]) != 1) return false;
+  int rrs = ((m[6] << 8) | m[7]) + ((m[8] << 8) | m[9]) + ((m[10] << 8) | m[11]);
+  int i = skipName(m, n, 12); if (i < 0 || i + 4 > n) return false; i += 4;
+  uint32_t mn = UINT32_MAX;
+  for (int r = 0; r < rrs; r++) {
+    i = skipName(m, n, i); if (i < 0 || i + 10 > n) return false;
+    uint16_t type = (m[i] << 8) | m[i + 1];
+    uint16_t rdlen = (m[i + 8] << 8) | m[i + 9];
+    if (type != 41) {
+      uint32_t ttl = ((uint32_t)m[i + 4] << 24) | ((uint32_t)m[i + 5] << 16) | ((uint32_t)m[i + 6] << 8) | m[i + 7];
+      if (ttl < mn) mn = ttl;
+      if (age) { ttl = ttl > age + 1 ? ttl - age : 1;
+        m[i + 4] = ttl >> 24; m[i + 5] = ttl >> 16; m[i + 6] = ttl >> 8; m[i + 7] = ttl; }
+    }
+    i += 10 + rdlen; if (i > n) return false;
+  }
+  *minTtl = mn;
+  return true;
+}
+// Fill buf with a cached answer for the query in buf. Returns its length, or 0 on a miss.
+static int cacheGet(uint64_t key, int qend) {
+  CachedAnswer* set = acache[key % AC_SETS];
+  const uint32_t now = millis();
+  for (int w = 0; w < AC_WAYS; w++) {
+    CachedAnswer& e = set[w];
+    if (e.key != key || e.qend != qend || e.edns != ((buf[10] | buf[11]) != 0)) continue;
+    bool same = true;
+    for (int i = 12; i < qend && same; i++) same = tolower(e.data[i]) == tolower(buf[i]);
+    if (!same) continue;
+    uint32_t age = (now - e.storedMs) / 1000;
+    if (age >= e.ttl) { e.key = 0; return 0; }
+    uint8_t id0 = buf[0], id1 = buf[1], q[260]; int ql = qend - 12;
+    if (ql <= 0 || ql > (int)sizeof(q)) return 0;
+    memcpy(q, buf + 12, ql);
+    memcpy(buf, e.data, e.len);
+    buf[0] = id0; buf[1] = id1; memcpy(buf + 12, q, ql);   // client's id + its exact question casing
+    uint32_t mn;
+    if (age) walkTtls(buf, e.len, &mn, age);
+    cacheHits++;
+    return e.len;
+  }
+  return 0;
+}
+// Store the upstream reply now in buf (only clean NOERROR / NXDOMAIN answers that fit).
+static void cachePut(uint64_t key, int n, int qend, bool edns) {
+  if (n < 12 || n > AC_MAX || qend > n) return;
+  if (buf[2] & 0x02) return;                    // truncated -> client will retry over TCP
+  uint8_t rcode = buf[3] & 0x0F; if (rcode != 0 && rcode != 3) return;
+  uint32_t ttl;
+  if (!walkTtls(buf, n, &ttl, 0)) return;
+  if (ttl == UINT32_MAX) ttl = AC_EMPTY_TTL;    // no records at all
+  if (ttl == 0) return;
+  if (ttl > AC_MAX_TTL) ttl = AC_MAX_TTL;
+  CachedAnswer* set = acache[key % AC_SETS];
+  CachedAnswer* slot = &set[0];
+  for (int w = 0; w < AC_WAYS; w++) {
+    if (set[w].key == key || set[w].key == 0) { slot = &set[w]; break; }
+    if ((int32_t)(set[w].storedMs - slot->storedMs) < 0) slot = &set[w];
+  }
+  slot->key = key; slot->storedMs = millis(); slot->ttl = ttl; slot->len = n; slot->qend = qend; slot->edns = edns;
+  memcpy(slot->data, buf, n);
+}
+
 // Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
@@ -349,7 +446,14 @@ static bool handleDns() {
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
+    else {
+      const bool cacheable = dl && qend <= qlen && ((buf[4] << 8) | buf[5]) == 1;
+      const uint64_t key = cacheable ? answerKey(qend) : 0;
+      const bool edns = (buf[10] | buf[11]) != 0;
+      rlen = cacheable ? cacheGet(key, qend) : 0;
+      if (!rlen) { rlen = forwardUpstream(qlen, qend); if (rlen > 0 && cacheable) cachePut(key, rlen, qend, edns); }
+      totalAllowed++; if (c) c->allowed++;
+    }
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
   }
   return did;
@@ -387,7 +491,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
+             ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
              ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
