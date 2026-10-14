@@ -21,6 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Build default blocklist (fails if any source is unreachable)
         run: |
+          set -o pipefail
           python3 tools/build_blocklist.py blocklist.bin 2>&1 | tee build.log
           # headerless copy for firmware older than the C3BL header (same domains)
           tail -c +17 blocklist.bin > blocklist-raw.bin
