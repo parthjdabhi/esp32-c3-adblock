@@ -72,7 +72,7 @@ sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allow
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],[s.chip=='ESP32'?'Temp (approx)':'Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none">${c.name?esc(c.name):'+ name'}</a></td><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||c.auto||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none;${!c.name&&c.auto?'font-style:italic':''}" title="${c.name?'set by you':(c.auto?'from the device (click to set your own)':'click to name')}">${c.name?esc(c.name):(c.auto?esc(c.auto):'+ name')}</a>${c.hint?` <span class=tag>${esc(c.hint)}</span>`:''}${c.priv?' <span class=tag title="phone/laptop private Wi-Fi address" style=color:#8b949e>private MAC</span>':''}</td><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
 <td>${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
 ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
