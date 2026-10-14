@@ -330,18 +330,23 @@ static bool setName(String key, String alt, String name) {
 // The device only sees DNS, so names come from what clients announce on the LAN:
 //  - DHCP: a joining device broadcasts its hostname (option 12) and often a vendor class
 //    (option 60, e.g. "android-dhcp-14", "MSFT 5.0"). We listen on UDP 67 (we're not the
-//    DHCP server, the router answers) and remember the hostname by MAC in /auto.txt.
-//  - NetBIOS: Windows PCs answer a node-status query on UDP 137 with their computer name.
+//    DHCP server, the router answers) and remember the hostname by MAC in /autonames.txt.
+//  - mDNS: Apple devices (and many others) answer a direct reverse lookup of their IP on
+//    UDP 5353 with their Bonjour hostname ("asds-MacBook-Pro", "iPhone-2").
+//  - NetBIOS: Windows PCs (and Macs with file sharing) answer a node-status query on UDP 137.
+// Best name: typed on the dashboard > DHCP hostname > mDNS > NetBIOS.
 //  - DNS hints: which vendor domains a client looks up ("Apple", "Android", ...).
 // A name typed on the dashboard always wins over these.
 static String macStr(const uint8_t* m);
+static int skipName(const uint8_t* m, int n, int i);
 static const int MAX_AUTO = 48;
-struct AutoName { uint8_t mac[6]; char host[33]; char vend[25]; };
+struct AutoName { uint8_t mac[6]; char host[33]; char mdns[33]; char nb[16]; char vend[25]; };
 static AutoName autoNames[MAX_AUTO]; static int numAuto = 0;
 static void saveAuto() {
-  File f = LittleFS.open("/auto.txt", "w"); if (!f) return;
-  for (int i = 0; i < numAuto; i++) f.printf("%02x%02x%02x%02x%02x%02x\t%s\t%s\n", autoNames[i].mac[0], autoNames[i].mac[1],
-    autoNames[i].mac[2], autoNames[i].mac[3], autoNames[i].mac[4], autoNames[i].mac[5], autoNames[i].host, autoNames[i].vend);
+  File f = LittleFS.open("/autonames.txt", "w"); if (!f) return;
+  for (int i = 0; i < numAuto; i++) { const AutoName& a = autoNames[i];
+    f.printf("%02x%02x%02x%02x%02x%02x\t%s\t%s\t%s\t%s\n", a.mac[0], a.mac[1], a.mac[2], a.mac[3], a.mac[4], a.mac[5],
+             a.host, a.vend, a.mdns, a.nb); }
   f.close();
 }
 // Copy only safe characters (letters, digits, - _ . space), so names are safe in JSON/HTML.
@@ -358,29 +363,34 @@ static AutoName* autoFor(const uint8_t* mac, bool create) {
   for (int i = 0; i < numAuto; i++) if (!memcmp(autoNames[i].mac, mac, 6)) return &autoNames[i];
   if (!create) return nullptr;
   AutoName* a = numAuto < MAX_AUTO ? &autoNames[numAuto++] : &autoNames[esp_random() % MAX_AUTO];
-  memcpy(a->mac, mac, 6); a->host[0] = a->vend[0] = 0;
+  memcpy(a->mac, mac, 6); a->host[0] = a->mdns[0] = a->nb[0] = a->vend[0] = 0;
   return a;
 }
-// Store a learned name; returns true if anything changed (caller saves).
-static bool learnName(const uint8_t* mac, const char* host, const char* vend) {
-  if (macZero(mac)) return false;
-  AutoName* a = autoFor(mac, false);
-  if (a && (!host[0] || !strcmp(a->host, host)) && (!vend[0] || !strcmp(a->vend, vend))) return false;
-  if (!a) a = autoFor(mac, true);
-  if (host[0]) strlcpy(a->host, host, sizeof(a->host));
-  if (vend[0]) strlcpy(a->vend, vend, sizeof(a->vend));
+// Store one learned field (host/mdns/nb/vend); returns true if it changed (caller saves).
+enum AutoField { AF_HOST, AF_VEND, AF_MDNS, AF_NB };
+static bool learnName(const uint8_t* mac, AutoField fld, const char* val) {
+  if (macZero(mac) || !val[0]) return false;
+  AutoName* a = autoFor(mac, true);
+  char* dst; size_t cap;
+  switch (fld) { case AF_HOST: dst = a->host; cap = sizeof(a->host); break; case AF_VEND: dst = a->vend; cap = sizeof(a->vend); break;
+                 case AF_MDNS: dst = a->mdns; cap = sizeof(a->mdns); break; default: dst = a->nb; cap = sizeof(a->nb); }
+  if (!strcmp(dst, val)) return false;
+  strlcpy(dst, val, cap);
   return true;
 }
 static void loadAuto() {
-  numAuto = 0; File f = LittleFS.open("/auto.txt", "r"); if (!f) return;
+  LittleFS.remove("/auto.txt");                    // test-build file with an older column layout
+  numAuto = 0; File f = LittleFS.open("/autonames.txt", "r"); if (!f) return;
   while (f.available() && numAuto < MAX_AUTO) {
     String l = f.readStringUntil('\n'); int t1 = l.indexOf('\t'); if (t1 != 12) continue;
-    int t2 = l.indexOf('\t', t1 + 1); if (t2 < 0) t2 = l.length();
     AutoName& a = autoNames[numAuto];
     for (int k = 0; k < 6; k++) a.mac[k] = (uint8_t)strtoul(l.substring(k * 2, k * 2 + 2).c_str(), nullptr, 16);
-    String h = l.substring(t1 + 1, t2), v = t2 < (int)l.length() ? l.substring(t2 + 1) : ""; v.trim();
-    cleanCopy(a.host, sizeof(a.host), (const uint8_t*)h.c_str(), h.length());
-    cleanCopy(a.vend, sizeof(a.vend), (const uint8_t*)v.c_str(), v.length());
+    String col[4]; int from = t1 + 1;                      // host, vend, mdns, nb
+    for (int k = 0; k < 4; k++) { int t = l.indexOf('\t', from); if (t < 0) t = l.length(); if (from <= (int)l.length()) col[k] = l.substring(from, t); from = t + 1; col[k].trim(); }
+    cleanCopy(a.host, sizeof(a.host), (const uint8_t*)col[0].c_str(), col[0].length());
+    cleanCopy(a.vend, sizeof(a.vend), (const uint8_t*)col[1].c_str(), col[1].length());
+    cleanCopy(a.mdns, sizeof(a.mdns), (const uint8_t*)col[2].c_str(), col[2].length());
+    cleanCopy(a.nb,   sizeof(a.nb),   (const uint8_t*)col[3].c_str(), col[3].length());
     numAuto++;
   }
   f.close();
@@ -400,34 +410,70 @@ static void handleDhcpSniff() {
       if (op == 60) cleanCopy(vend, sizeof(vend), p + i, len);
       i += len;
     }
-    if ((host[0] || vend[0]) && learnName(p + 28, host, vend)) {
+    bool ch = learnName(p + 28, AF_HOST, host); ch |= learnName(p + 28, AF_VEND, vend);
+    if (ch) {
       Serial.printf("[names] dhcp %s %s (%s)\n", macStr(p + 28).c_str(), host, vend);
       saveAuto();
     }
   }
 }
-// NetBIOS node status ("what's your name?") to IPv4 clients we have no name for:
-// one query every 2 s at most, and each client at most every 10 minutes.
-static void askNetbios() {
+// Ask IPv4 clients we have no good name for: mDNS reverse lookup + NetBIOS node status.
+// One client every 2 s at most, each client at most every 10 minutes.
+static void askNames() {
   static uint32_t last = 0; if (millis() - last < 2000) return; last = millis();
-  static const uint8_t q[] = { 0x4e, 0x42, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
+  static const uint8_t nbq[] = { 0x4e, 0x42, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
     'C','K','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
     0x00, 0x00, 0x21, 0x00, 0x01 };
   for (int i = 0; i < numClients; i++) {
     Dev& c = clients[i];
     if (c.v6 || macZero(c.mac)) continue;
-    AutoName* a = autoFor(c.mac, false); if (a && a->host[0]) continue;
+    AutoName* a = autoFor(c.mac, false); if (a && (a->host[0] || a->mdns[0])) continue;
     if (c.nbAskedMs && millis() - c.nbAskedMs < 600000UL) continue;
     c.nbAskedMs = millis() | 1;
-    nbUdp.beginPacket(IPAddress(c.ip), 137); nbUdp.write(q, sizeof(q)); nbUdp.endPacket();
+    // mDNS "legacy unicast" query straight to the client: d.c.b.a.in-addr.arpa PTR
+    uint8_t q[64] = {0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}; int o = 12;
+    for (int k = 3; k >= 0; k--) { char t[4]; int n = snprintf(t, sizeof(t), "%u", (unsigned)((c.ip >> (8 * k)) & 0xFF)); q[o++] = n; memcpy(q + o, t, n); o += n; }
+    q[o++] = 7; memcpy(q + o, "in-addr", 7); o += 7; q[o++] = 4; memcpy(q + o, "arpa", 4); o += 4; q[o++] = 0;
+    q[o++] = 0; q[o++] = 12; q[o++] = 0; q[o++] = 1;
+    nbUdp.beginPacket(IPAddress(c.ip), 5353); nbUdp.write(q, o); nbUdp.endPacket();
+    nbUdp.beginPacket(IPAddress(c.ip), 137); nbUdp.write(nbq, sizeof(nbq)); nbUdp.endPacket();
     return;
+  }
+}
+// First label of a (possibly compressed) DNS name at m[i], e.g. "iPhone-2" of "iPhone-2.local".
+static bool firstLabel(const uint8_t* m, int n, int i, char* out, size_t cap) {
+  for (int hops = 0; hops < 8 && i < n; hops++) {
+    uint8_t l = m[i];
+    if ((l & 0xC0) == 0xC0) { if (i + 1 >= n) return false; i = ((l & 0x3F) << 8) | m[i + 1]; continue; }
+    if (l == 0 || l > 63 || i + 1 + l > n) return false;
+    cleanCopy(out, cap, m + i + 1, l); return out[0] != 0;
+  }
+  return false;
+}
+static void handleMdnsReply(const uint8_t* p, int n, uint32_t from) {
+  if (n < 12 || !(p[2] & 0x80)) return;
+  int qd = (p[4] << 8) | p[5], an = (p[6] << 8) | p[7];
+  int i = 12;
+  for (int k = 0; k < qd; k++) { i = skipName(p, n, i); if (i < 0 || i + 4 > n) return; i += 4; }
+  for (int k = 0; k < an; k++) {
+    i = skipName(p, n, i); if (i < 0 || i + 10 > n) return;
+    uint16_t type = (p[i] << 8) | p[i + 1], rdlen = (p[i + 8] << 8) | p[i + 9];
+    int rd = i + 10; if (rd + rdlen > n) return;
+    char host[33];
+    if (type == 12 && firstLabel(p, n, rd, host, sizeof(host)) && strcasecmp(host, "localhost") != 0) {
+      for (int c = 0; c < numClients; c++) if (!clients[c].v6 && clients[c].ip == from)
+        if (learnName(clients[c].mac, AF_MDNS, host)) { Serial.printf("[names] mdns %s\n", host); saveAuto(); }
+      return;
+    }
+    i = rd + rdlen;
   }
 }
 static void handleNetbios() {
   static uint8_t p[600];
   int sz = nbUdp.parsePacket(); if (sz <= 0) return;
-  uint32_t from = (uint32_t)nbUdp.remoteIP();
+  uint32_t from = (uint32_t)nbUdp.remoteIP(); uint16_t port = nbUdp.remotePort();
   int n = nbUdp.read(p, sizeof(p)); nbUdp.flush();
+  if (port == 5353) { handleMdnsReply(p, n, from); return; }
   if (n < 57 + 18 || p[0] != 0x4e || p[1] != 0x42 || !(p[2] & 0x80)) return;
   int count = p[56];
   for (int k = 0; k < count && 57 + (k + 1) * 18 <= n; k++) {
@@ -437,7 +483,7 @@ static void handleNetbios() {
     for (int t = (int)strlen(host) - 1; t >= 0 && host[t] == ' '; t--) host[t] = 0;
     if (!host[0]) return;
     for (int i = 0; i < numClients; i++) if (!clients[i].v6 && clients[i].ip == from)
-      if (learnName(clients[i].mac, host, "")) { Serial.printf("[names] netbios %s\n", host); saveAuto(); }
+      if (learnName(clients[i].mac, AF_NB, host)) { Serial.printf("[names] netbios %s\n", host); saveAuto(); }
     return;
   }
 }
@@ -456,7 +502,11 @@ static void hintFromQuery(Dev* c, const char* d) {
   };
   for (auto& pr : pat) if (strstr(d, pr[0])) { c->hint = pr[1]; return; }
 }
-static String autoHost(const Dev& c) { const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false); return a ? String(a->host) : String(""); }
+static String autoHost(const Dev& c) {
+  const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false);
+  if (!a) return "";
+  return String(a->host[0] ? a->host : a->mdns[0] ? a->mdns : a->nb);
+}
 static String autoHint(const Dev& c) {
   if (c.hint) return c.hint;
   const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false);
@@ -1192,7 +1242,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  handleDhcpSniff(); handleNetbios(); askNetbios();
+  handleDhcpSniff(); handleNetbios(); askNames();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
