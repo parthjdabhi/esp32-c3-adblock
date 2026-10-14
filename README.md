@@ -87,6 +87,11 @@ python3 tools/build_blocklist.py data/blocklist.bin
 # 3. flash firmware + the blocklist filesystem (the one and only USB flash)
 pio run -t upload
 pio run -t uploadfs
+#    C3 SuperMini that drops WiFi or whose setup AP doesn't show up on the phone:
+#    use the low TX power build instead
+pio run -e c3-supermini -t upload && pio run -e c3-supermini -t uploadfs
+#    classic ESP32: pass the env to BOTH commands (the default env is c3)
+pio run -e esp32dev -t upload && pio run -e esp32dev -t uploadfs
 
 # 4. watch it boot, note the IP / open the dashboard
 pio device monitor          # -> http://c3adblock.local
@@ -116,6 +121,18 @@ type the password, done. To move it to a new network later: click **Forget WiFi*
 the dashboard, or hold the **BOOT** button while powering on, and the setup portal
 comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
 just visit — see Security below.)
+
+**Router without DHCP reservation?** Build with a fixed address outside the router's
+DHCP pool, then point the router's DNS setting at it:
+
+```ini
+build_flags = ${env:c3.build_flags}
+    -DSTATIC_IP=192,168,1,250
+    -DSTATIC_GW=192,168,1,1
+    ; optional: -DSTATIC_MASK=255,255,255,0  -DSTATIC_DNS=9,9,9,9
+```
+
+With a static IP the board only works on that network; rebuild without the flags to move it.
 
 ## Over-the-air updates (no more USB)
 

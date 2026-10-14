@@ -28,6 +28,13 @@
 #define UPSTREAM_PORT 53
 #endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
+// Optional build flags (platformio.ini build_flags):
+//   -DWIFI_TX_POWER=WIFI_POWER_8_5dBm  lower TX power. Many C3 SuperMini boards have a weak
+//                                      antenna layout and drop WiFi (or the setup AP is not
+//                                      visible) at full power. See [env:c3-supermini].
+//   -DSTATIC_IP=192,168,1,250 -DSTATIC_GW=192,168,1,1 -DSTATIC_MASK=255,255,255,0
+//   -DSTATIC_DNS=9,9,9,9               fixed address for routers without DHCP reservation.
+//                                      Keep it outside the router's DHCP pool.
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -507,7 +514,23 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+#ifdef STATIC_IP
+#ifndef STATIC_MASK
+#define STATIC_MASK 255, 255, 255, 0
+#endif
+#ifndef STATIC_DNS
+#define STATIC_DNS UPSTREAM_IP
+#endif
+  if (WiFi.config(IPAddress(STATIC_IP), IPAddress(STATIC_GW), IPAddress(STATIC_MASK), IPAddress(STATIC_DNS)))
+    Serial.printf("WiFi: static IP %s\n", IPAddress(STATIC_IP).toString().c_str());
+  else
+    Serial.println("WiFi: static IP config failed, using DHCP");
+#endif
+  WiFi.begin(ssid, pass);
+#ifdef WIFI_TX_POWER
+  WiFi.setTxPower(WIFI_TX_POWER);
+#endif
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
@@ -522,15 +545,20 @@ static void handlePortalRoot() {
     "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
     "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<datalist id=nets>" + portalOpts + "</datalist>"
+    // A real <select> is usable on every phone; the datalist this used to be
+    // renders an affordance in several in-app browsers but no list, so picking
+    // a network looked impossible. Typing the name still covers hidden APs.
+    "<select name=s style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>" + portalOpts + "</select>"
+    "<input name=s2 placeholder='or type the WiFi name' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
     "</form></body>";
   web.send(200, "text/html", html);
 }
 static void handleWifiSave() {
-  String ss = web.arg("s"), pw = web.arg("p");
+  String ss = web.arg("s2"); ss.trim();          // typed name wins
+  if (!ss.length()) ss = web.arg("s");           // ...otherwise the picked one
+  String pw = web.arg("p");
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
@@ -540,12 +568,29 @@ static void handleWifiSave() {
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
 static void startConfigPortal() {
-  int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
-  portalOpts = "";
-  for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
+  // Bring the radio up before the first scan. An unconfigured device gets here
+  // straight from connectWiFi() without any WiFi call, and the first scan right
+  // after boot can come back empty - which left the network list with no
+  // entries at all. Start the station, then retry a few times.
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  int n = 0;
+  for (int attempt = 1; attempt <= 3 && n <= 0; attempt++) {
+    if (attempt > 1) delay(700);
+    n = WiFi.scanNetworks();
+    Serial.printf("[setup] scan %d/3: %d networks\n", attempt, n);
+  }
+  portalOpts = "<option value=''>-- pick your network --</option>";
+  for (int i = 0; i < n && i < 15; i++) {
+    const String s = WiFi.SSID(i);
+    portalOpts += "<option value='" + htmlEscape(s) + "'>" + htmlEscape(s) + "</option>";
+  }
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+#ifdef WIFI_TX_POWER
+  WiFi.setTxPower(WIFI_TX_POWER);
+#endif
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
