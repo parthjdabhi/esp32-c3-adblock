@@ -28,6 +28,11 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <button id=pausebtn onclick=togglePause()>Pause</button></div>
 <div class=cards id=sys></div>
 <h2>CLIENTS</h2><table id=ct><thead><tr><th>Name</th><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
+<details id=lkd ontoggle="if(lkd.open)loadQ()"><summary style="cursor:pointer;color:#8b949e;font-size:14px;margin:18px 0 8px">RECENT LOOKUPS <span style=font-size:12px>(last 200, needs login)</span></summary>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px"><select id=qcl onchange=drawQ()><option value="">all devices</option></select>
+<select id=qst onchange=drawQ()><option value="">all</option><option value=b>blocked</option><option value=a>allowed</option></select>
+<input id=qtx placeholder="search domain" oninput=drawQ() size=18> <button onclick=loadQ()>Refresh</button> <span id=qmsg style=color:#8b949e></span></div>
+<table id=qt><thead><tr><th>When</th><th>Device</th><th>Domain</th><th>Type</th><th>Result</th><th></th></tr></thead><tbody></tbody></table></details>
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com or a URL" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
@@ -76,10 +81,27 @@ ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
 <td>${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
 ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
+CUST=s.custom;CL={};s.clients.forEach(c=>CL[c.ip]=(c.name||c.auto||c.ip)+(c.name||c.auto?' ('+c.ip+')':''));
+{let o='<option value="">all devices</option>'+s.clients.map(c=>`<option value="${esc(c.ip)}">${esc(CL[c.ip])}</option>`).join('');
+if(o!=window.QOPT&&document.activeElement!=qcl){let v=qcl.value;qcl.innerHTML=o;qcl.value=v;window.QOPT=o}}
+if(lkd.open&&!document.hidden&&Date.now()-(window.QLAST||0)>5000){window.QLAST=Date.now();loadQ()}
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
+let CL={},QD=[],CUST=[];
+const QT={1:'A',5:'CNAME',12:'PTR',16:'TXT',28:'AAAA',33:'SRV',64:'SVCB',65:'HTTPS'};
+const QS={b:['blocked','b'],n:['banned client','b'],c:['allowed (cache)','a'],f:['allowed','a'],x:['no answer','']};
+function ago(s){return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'}
+async function loadQ(){try{let r=await fetch('/queries.json',{headers:CSRF_HDRS});if(!r.ok){qmsg.textContent='✗ '+r.status;return}
+QD=(await r.json()).q;qmsg.textContent=QD.length+' lookups';drawQ()}catch(_){qmsg.textContent='✗ failed'}}
+function drawQ(){let cl=qcl.value,st=qst.value,tx=qtx.value.trim().toLowerCase();
+qt.tBodies[0].innerHTML=QD.filter(q=>(!cl||q[1]==cl)&&(!st||(QS[q[4]]||['',''])[1]==st)&&(!tx||q[2].includes(tx))).slice(0,200).map(q=>{let s=QS[q[4]]||[q[4],''],bl=s[1]=='b';
+let act=bl?(CUST.includes(q[2])?`<button class=qub data-d="${esc(q[2])}">unblock</button>`:''):`<button class=qbl data-d="${esc(q[2])}">block</button>`;
+return `<tr><td>${ago(q[0])}</td><td>${esc(CL[q[1]]||q[1])}</td><td>${esc(q[2])}</td><td>${QT[q[3]]||q[3]}</td><td class=${s[1]}>${s[0]}</td><td>${act}</td></tr>`}).join('')||'<tr><td colspan=6 style=color:#8b949e>nothing yet</td></tr>'}
+qt.addEventListener('click',e=>{let d=e.target.dataset.d;if(!d)return;
+if(e.target.classList.contains('qbl')&&confirm('Block '+d+' (and its subdomains) for everyone?'))fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)});
+if(e.target.classList.contains('qub'))fetch('/unblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)})});
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(async r=>{if(r.ok)dom.value='';else alert('✗ '+await r.text());load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('nm')){e.preventDefault();let n=prompt('Name for '+e.target.dataset.k+' (empty = remove)',e.target.dataset.n);if(n!==null)fetch('/setname?k='+encodeURIComponent(e.target.dataset.k)+'&ip='+encodeURIComponent(e.target.dataset.ip)+'&n='+encodeURIComponent(n.trim()),{headers:CSRF_HDRS}).then(load);return}
 if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
