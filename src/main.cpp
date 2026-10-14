@@ -75,7 +75,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; bool v6; alignas(4) uint8_t ip6[16]; const char* hint; uint32_t nbAskedMs; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; bool v6; alignas(4) uint8_t ip6[16]; const char* hint; uint32_t nbAskedMs; int8_t logSlot; uint8_t logPos; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -264,7 +264,7 @@ static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (!clients[i].v6 && clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->v6 = false; c->hint = nullptr; c->nbAskedMs = 0; c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->v6 = false; c->hint = nullptr; c->nbAskedMs = 0; c->logSlot = -1; c->logPos = 0; c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
     getMac(ip, c->mac); return c;
   }
   return nullptr;
@@ -274,7 +274,7 @@ static Dev* getClient6(const uint8_t* a) {
   for (int i = 0; i < numClients; i++) if (clients[i].v6 && !memcmp(clients[i].ip6, a, 16)) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients >= MAX_CLIENTS) return nullptr;
   Dev* c = &clients[numClients++];
-  c->v6 = true; c->hint = nullptr; c->nbAskedMs = 0; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
+  c->v6 = true; c->hint = nullptr; c->nbAskedMs = 0; c->logSlot = -1; c->logPos = 0; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
   memset(c->mac, 0, 6);
   return c;
 }
@@ -690,15 +690,30 @@ static void cachePut(uint64_t key, int n, int qend, bool edns) {
 }
 
 // ---------- recent lookups (dashboard) ----------
-// Ring buffer of the last LOG_N lookups: who asked, what, and what we did. Lives on the heap
-// (allocated in setup); names longer than 63 chars are cut. Read via /queries.json (auth).
-static const int LOG_N = 200;
-struct LookupLog { uint32_t ms; uint8_t client; char st; uint16_t qtype; char name[64]; };
-static LookupLog* lookups = nullptr; static uint32_t lookupSeq = 0;
-static void logLookup(const Dev* c, const char* name, uint16_t qtype, char st) {
-  if (!lookups || !name[0]) return;
-  LookupLog& e = lookups[lookupSeq++ % LOG_N];
-  e.ms = millis(); e.client = c ? (uint8_t)(c - clients) : 255; e.st = st; e.qtype = qtype;
+// The last LOG_PER lookups of each device (who asked, what, and what we did), so a busy
+// device can't push a quiet one out. LOG_DEVS devices get a slot; when they're all taken,
+// the device seen longest ago gives its slot up. Heap, allocated in setup(); names longer
+// than 40 chars are cut. Read via /queries.json (auth).
+static const int LOG_DEVS = 32, LOG_PER = 20;
+struct LookupLog { uint32_t ms; uint16_t qtype; char st; char name[41]; };
+static LookupLog* lookups = nullptr;          // [LOG_DEVS][LOG_PER]
+static Dev* logOwner[LOG_DEVS];
+static void logLookup(Dev* c, const char* name, uint16_t qtype, char st) {
+  if (!lookups || !c || !name[0]) return;
+  if (c->logSlot < 0) {
+    int slot = -1;
+    for (int i = 0; i < LOG_DEVS && slot < 0; i++) if (!logOwner[i]) slot = i;
+    if (slot < 0) {                             // all taken: reuse the one idle the longest
+      slot = 0;
+      for (int i = 1; i < LOG_DEVS; i++) if ((int32_t)(logOwner[i]->lastSeen - logOwner[slot]->lastSeen) < 0) slot = i;
+      logOwner[slot]->logSlot = -1;
+    }
+    logOwner[slot] = c; c->logSlot = slot; c->logPos = 0;
+    memset(&lookups[slot * LOG_PER], 0, sizeof(LookupLog) * LOG_PER);
+  }
+  LookupLog& e = lookups[c->logSlot * LOG_PER + c->logPos];
+  c->logPos = (c->logPos + 1) % LOG_PER;
+  e.ms = millis(); e.st = st; e.qtype = qtype;
   size_t i = 0;
   for (; name[i] && i < sizeof(e.name) - 1; i++) { char ch = name[i]; e.name[i] = (ch > 0x20 && ch < 0x7f && ch != '"' && ch != '\\' && ch != '<' && ch != '>') ? ch : '?'; }
   e.name[i] = 0;
@@ -1227,7 +1242,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  lookups = (LookupLog*)calloc(LOG_N, sizeof(LookupLog));
+  lookups = (LookupLog*)calloc(LOG_DEVS * LOG_PER, sizeof(LookupLog));
   acache = (CachedAnswer (*)[AC_WAYS])calloc(AC_SETS, sizeof(CachedAnswer[AC_WAYS]));
   if (!acache) Serial.println("[cache] no RAM, answer cache off");
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
@@ -1266,20 +1281,29 @@ void setup() {
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
-  web.on("/queries.json", []() {          // recent lookups, newest first: [ageSec, clientIp, name, qtype, status]
+  web.on("/queries.json", []() {          // recent lookups per device: [ageSec, clientIp, name, qtype, status]
     if (!requireAuth()) return;           // it's browsing history, so not public like stats.json
-    String j; j.reserve(12000); j = "{\"q\":[";
-    const uint32_t now = millis(); const uint32_t n = lookupSeq < (uint32_t)LOG_N ? lookupSeq : LOG_N;
-    for (uint32_t k = 0; lookups && k < n; k++) {
-      const LookupLog& e = lookups[(lookupSeq - 1 - k) % LOG_N];
-      String ip = "";
-      if (e.client < numClients) { const Dev& c = clients[e.client];
-        if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); char t6[48]; ip6addr_ntoa_r(&a6, t6, sizeof(t6)); ip = t6; }
-        else ip = IPAddress(c.ip).toString(); }
-      j += k ? "," : ""; j += "[" + String((now - e.ms) / 1000) + ",\"" + ip + "\",\"" + e.name + "\"," + String(e.qtype) + ",\"" + String(e.st) + "\"]";
+    String want = web.arg("ip");          // optional: one device only
+    web.setContentLength(CONTENT_LENGTH_UNKNOWN);   // streamed per device, no big String in RAM
+    web.send(200, "application/json", "{\"q\":[");
+    const uint32_t now = millis(); bool first = true;
+    for (int s = 0; lookups && s < LOG_DEVS; s++) {
+      const Dev* c = logOwner[s]; if (!c) continue;
+      String ip;
+      if (c->v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c->ip6, 16); char t6[48]; ip6addr_ntoa_r(&a6, t6, sizeof(t6)); ip = t6; }
+      else ip = IPAddress(c->ip).toString();
+      if (want.length() && want != ip) continue;
+      String j;
+      for (int k = 0; k < LOG_PER; k++) {
+        const LookupLog& e = lookups[s * LOG_PER + (c->logPos + LOG_PER - 1 - k) % LOG_PER];   // newest first
+        if (!e.name[0]) continue;
+        j += first ? "" : ","; first = false;
+        j += "[" + String((now - e.ms) / 1000) + ",\"" + ip + "\",\"" + e.name + "\"," + String(e.qtype) + ",\"" + String(e.st) + "\"]";
+      }
+      if (j.length()) web.sendContent(j);
     }
-    j += "]}";
-    web.send(200, "application/json", j);
+    web.sendContent("]}");
+    web.sendContent("");                  // end of chunked reply
   });
   web.on("/setname", []() {              // /setname?k=<mac or ip>&ip=<ip>&n=<name>  (empty n = remove)
     if (!requireAuth()) return;
