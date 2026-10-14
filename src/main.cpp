@@ -276,6 +276,51 @@ static Dev* getClient6(const uint8_t* a) {
   memset(c->mac, 0, 6);
   return c;
 }
+// The MAC is read from the ARP table, which usually has no entry yet when a client's very
+// first query arrives (the reply hasn't been sent). Retry until it's known.
+static bool macZero(const uint8_t* m) { for (int k = 0; k < 6; k++) if (m[k]) return false; return true; }
+static void refreshMacs() {
+  for (int i = 0; i < numClients; i++) if (!clients[i].v6 && macZero(clients[i].mac)) getMac(clients[i].ip, clients[i].mac);
+}
+
+// Friendly device names set on the dashboard, saved in /names.txt as "key name" lines.
+// key = MAC when known (survives IP changes), else the IP address.
+static const int MAX_NAMES = 64;
+String nameKey[MAX_NAMES], nameVal[MAX_NAMES]; int numNames = 0;
+static String cleanName(String n) {
+  String o; for (char ch : n) if ((uint8_t)ch >= 0x20 && ch != '"' && ch != '\\' && ch != '<' && ch != '>') o += ch;
+  o.trim(); if (o.length() > 32) o = o.substring(0, 32);
+  return o;
+}
+static void loadNames() {
+  numNames = 0; File f = LittleFS.open("/names.txt", "r"); if (!f) return;
+  while (f.available() && numNames < MAX_NAMES) {
+    String l = f.readStringUntil('\n'); l.trim(); int sp = l.indexOf(' ');
+    if (sp > 0) { nameKey[numNames] = l.substring(0, sp); nameVal[numNames] = cleanName(l.substring(sp + 1)); if (nameVal[numNames].length()) numNames++; }
+  }
+  f.close();
+}
+static void saveNames() {
+  File f = LittleFS.open("/names.txt", "w"); if (!f) return;
+  for (int i = 0; i < numNames; i++) f.println(nameKey[i] + " " + nameVal[i]);
+  f.close();
+}
+static bool setName(String key, String name) {
+  key.trim(); key.toLowerCase(); name = cleanName(name);
+  if (!key.length() || key.length() > 46 || key.indexOf(' ') >= 0) return false;
+  for (int i = 0; i < numNames; i++) if (nameKey[i] == key) {
+    if (name.length()) nameVal[i] = name;
+    else { for (int k = i; k < numNames - 1; k++) { nameKey[k] = nameKey[k + 1]; nameVal[k] = nameVal[k + 1]; } numNames--; }
+    saveNames(); return true;
+  }
+  if (!name.length()) return true;
+  if (numNames >= MAX_NAMES) return false;
+  nameKey[numNames] = key; nameVal[numNames] = name; numNames++; saveNames(); return true;
+}
+static String nameOf(const String& mac, const String& ip) {
+  for (int i = 0; i < numNames; i++) if (nameKey[i] == mac || nameKey[i] == ip) return nameVal[i];
+  return "";
+}
 
 // ---------- DNS ----------
 static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype, int* qend) {
@@ -544,6 +589,7 @@ static String htmlEscape(const String& s) {
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
 static void handleStats() {
+  refreshMacs();
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
@@ -560,7 +606,9 @@ static void handleStats() {
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     char t6[48] = ""; if (c.v6) ip6addr_ntoa_r((const ip6_addr_t*)c.ip6, t6, sizeof(t6));
-    j += (i ? "," : ""); j += "{\"ip\":\"" + (c.v6 ? String(t6) : ip.toString()) + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    String ips = c.v6 ? String(t6) : ip.toString(), ms = macStr(c.mac);
+    String key = macZero(c.mac) ? ips : ms;
+    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
@@ -858,7 +906,7 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg();
+  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg(); loadNames();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -915,6 +963,10 @@ void setup() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
+  web.on("/setname", []() {              // /setname?k=<mac or ip>&n=<name>  (empty n = remove)
+    if (!requireAuth()) return;
+    web.send(setName(web.arg("k"), web.arg("n")) ? 200 : 400, "text/plain", "ok");
   });
   web.on("/setdns", []() {               // /setdns?p=9.9.9.9&b=1.1.1.1  (b empty = no backup, def=1 = defaults)
     if (!requireAuth()) return;

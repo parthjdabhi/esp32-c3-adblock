@@ -27,7 +27,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <select id=pausedur style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=30>30s</option><option value=300 selected>5 min</option><option value=1800>30 min</option><option value=0>until I re-enable</option></select>
 <button id=pausebtn onclick=togglePause()>Pause</button></div>
 <div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
+<h2>CLIENTS</h2><table id=ct><thead><tr><th>Name</th><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com or a URL" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
@@ -72,7 +72,7 @@ sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allow
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],[s.chip=='ESP32'?'Temp (approx)':'Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-n="${esc(c.name||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none">${c.name?esc(c.name):'+ name'}</a></td><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
 <td>${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
 ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
@@ -81,7 +81,8 @@ if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(async r=>{if(r.ok)dom.value='';else alert('✗ '+await r.text());load()})}}
-ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
+ct.addEventListener('click',e=>{if(e.target.classList.contains('nm')){e.preventDefault();let n=prompt('Name for '+e.target.dataset.k+' (empty = remove)',e.target.dataset.n);if(n!==null)fetch('/setname?k='+encodeURIComponent(e.target.dataset.k)+'&n='+encodeURIComponent(n.trim()),{headers:CSRF_HDRS}).then(load);return}
+if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
