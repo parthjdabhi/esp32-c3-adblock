@@ -307,17 +307,24 @@ static void saveNames() {
   for (int i = 0; i < numNames; i++) f.println(nameKey[i] + " " + nameVal[i]);
   f.close();
 }
-static bool setName(String key, String name) {
-  key.trim(); key.toLowerCase(); name = cleanName(name);
-  if (!key.length() || key.length() > 46 || key.indexOf(' ') >= 0) return false;
-  for (int i = 0; i < numNames; i++) if (nameKey[i] == key) {
-    if (name.length()) nameVal[i] = name;
-    else { for (int k = i; k < numNames - 1; k++) { nameKey[k] = nameKey[k + 1]; nameVal[k] = nameVal[k + 1]; } numNames--; }
-    saveNames(); return true;
+// alt = the client's other key (its IP when key is the MAC), so a name saved before the MAC
+// was known is replaced or removed too, instead of lingering under the old key.
+static bool setName(String key, String alt, String name) {
+  key.trim(); key.toLowerCase(); alt.trim(); alt.toLowerCase(); name = cleanName(name);
+  if (!key.length() || key.length() > 46 || key.indexOf(' ') >= 0 || alt.indexOf(' ') >= 0) return false;
+  bool changed = false;
+  for (int i = 0; i < numNames; ) {
+    if (nameKey[i] == key || (alt.length() && nameKey[i] == alt)) {
+      for (int k = i; k < numNames - 1; k++) { nameKey[k] = nameKey[k + 1]; nameVal[k] = nameVal[k + 1]; }
+      numNames--; changed = true;
+    } else i++;
   }
-  if (!name.length()) return true;
-  if (numNames >= MAX_NAMES) return false;
-  nameKey[numNames] = key; nameVal[numNames] = name; numNames++; saveNames(); return true;
+  if (name.length()) {
+    if (numNames >= MAX_NAMES) { if (changed) saveNames(); return false; }
+    nameKey[numNames] = key; nameVal[numNames] = name; numNames++; changed = true;
+  }
+  if (changed) saveNames();
+  return true;
 }
 static String nameOf(const String& mac, const String& ip) {
   for (int i = 0; i < numNames; i++) if (nameKey[i] == mac || nameKey[i] == ip) return nameVal[i];
@@ -399,7 +406,7 @@ static int forwardUpstream(int qlen, int qend) {
 static const int AC_SETS = 16, AC_WAYS = 4, AC_MAX = 512;   // 64 answers, ~33 KB
 static const uint32_t AC_MAX_TTL = 3600, AC_EMPTY_TTL = 60;
 struct CachedAnswer { uint64_t key; uint32_t storedMs, ttl; uint16_t len, qend; bool edns; uint8_t data[AC_MAX]; };
-static CachedAnswer acache[AC_SETS][AC_WAYS];
+static CachedAnswer (*acache)[AC_WAYS] = nullptr;   // heap, allocated in setup() (classic ESP32 static DRAM is tight)
 uint32_t cacheHits = 0;
 static uint64_t acSeed = 0;                     // random per boot, so set placement can't be precomputed
 
@@ -446,6 +453,7 @@ static bool walkTtls(uint8_t* m, int n, uint32_t* minTtl, uint32_t age) {
 }
 // Fill buf with a cached answer for the query in buf. Returns its length, or 0 on a miss.
 static int cacheGet(uint64_t key, int qend) {
+  if (!acache) return 0;
   CachedAnswer* set = acache[key % AC_SETS];
   const uint32_t now = millis();
   for (int w = 0; w < AC_WAYS; w++) {
@@ -470,6 +478,7 @@ static int cacheGet(uint64_t key, int qend) {
 }
 // Store the upstream reply now in buf (only clean NOERROR / NXDOMAIN answers that fit).
 static void cachePut(uint64_t key, int n, int qend, bool edns) {
+  if (!acache) return;
   if (n < 12 || n > AC_MAX || qend > n) return;
   if (buf[2] & 0x02) return;                    // truncated -> client will retry over TCP
   uint8_t rcode = buf[3] & 0x0F; if (rcode != 0 && rcode != 3) return;
@@ -607,7 +616,8 @@ static void handleStats() {
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    char t6[48] = ""; if (c.v6) ip6addr_ntoa_r((const ip6_addr_t*)c.ip6, t6, sizeof(t6));
+    char t6[48] = "";
+    if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); ip6addr_ntoa_r(&a6, t6, sizeof(t6)); }
     String ips = c.v6 ? String(t6) : ip.toString(), ms = macStr(c.mac);
     String key = macZero(c.mac) ? ips : ms;
     j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
@@ -970,6 +980,8 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
+  acache = (CachedAnswer (*)[AC_WAYS])calloc(AC_SETS, sizeof(CachedAnswer[AC_WAYS]));
+  if (!acache) Serial.println("[cache] no RAM, answer cache off");
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
 #ifndef NO_IPV6_DNS
   WiFi.enableIpV6();                                      // link-local now; SLAAC global from router RAs
@@ -1005,9 +1017,9 @@ void setup() {
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
-  web.on("/setname", []() {              // /setname?k=<mac or ip>&n=<name>  (empty n = remove)
+  web.on("/setname", []() {              // /setname?k=<mac or ip>&ip=<ip>&n=<name>  (empty n = remove)
     if (!requireAuth()) return;
-    web.send(setName(web.arg("k"), web.arg("n")) ? 200 : 400, "text/plain", "ok");
+    web.send(setName(web.arg("k"), web.arg("ip"), web.arg("n")) ? 200 : 400, "text/plain", "ok");
   });
   web.on("/setdns", []() {               // /setdns?p=9.9.9.9&b=1.1.1.1  (b empty = no backup, def=1 = defaults)
     if (!requireAuth()) return;
