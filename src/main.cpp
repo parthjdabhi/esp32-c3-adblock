@@ -33,7 +33,7 @@
 #define UPSTREAM_PORT 53
 #endif
 #ifndef FW_VERSION
-#define FW_VERSION "dev"                          // set by tools/version.py from git describe
+#define FW_VERSION "dev"                          // set by tools/version.py from the VERSION file
 #endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);     // defaults; the dashboard can change both
 static const IPAddress UPSTREAM2(UPSTREAM2_IP);
@@ -1285,6 +1285,35 @@ void setup() {
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
+  web.on("/reboot", []() { if (!requireAuth()) return; web.send(200, "text/plain", "rebooting");
+    Serial.println("[web] reboot"); delay(500); ESP.restart(); });
+  web.on("/resetstats", []() {           // counters + recent lookups only, nothing saved is touched
+    if (!requireAuth()) return;
+    totalBlocked = totalAllowed = droppedQueries = cacheHits = queries6 = 0;
+    upAnswered[0] = upAnswered[1] = upTimeouts[0] = upTimeouts[1] = 0;
+    for (int i = 0; i < numClients; i++) clients[i].blocked = clients[i].allowed = 0;
+    if (lookups) memset(lookups, 0, LOG_DEVS * LOG_PER * sizeof(LookupLog));
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/resetsettings", []() {        // ?c=RESET  saved settings back to defaults; WiFi + blocklist stay
+    if (!requireAuth()) return;
+    if (web.arg("c") != "RESET") { web.send(400, "text/plain", "confirm with c=RESET"); return; }
+    for (const char* p : { "/custom.txt", "/banned.txt", "/names.txt", "/autonames.txt", "/dns.cfg", "/update.cfg" }) LittleFS.remove(p);
+    web.send(200, "text/plain", "settings cleared, rebooting");
+    Serial.println("[web] settings reset"); delay(500); ESP.restart();
+  });
+  web.on("/export.json", []() {          // backup of everything /resetsettings clears (except learned names)
+    if (!requireAuth()) return;
+    String j = "{\"ver\":\"" FW_VERSION "\",\"custom\":[";
+    for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+    j += "],\"names\":[";
+    for (int i = 0; i < numNames; i++) { j += (i ? "," : ""); j += "[\"" + jesc(nameKey[i]) + "\",\"" + jesc(nameVal[i]) + "\"]"; }
+    j += "],\"banned\":[";
+    for (int i = 0; i < numBanned; i++) { j += (i ? "," : ""); j += "\"" + IPAddress(bannedIP[i]).toString() + "\""; }
+    j += "],\"dns\":[\"" + upDns[0].toString() + "\",\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"]" +
+         ",\"update\":{\"url\":\"" + jesc(updateUrl) + "\",\"hours\":" + updateIntervalH + "}}";
+    web.send(200, "application/json", j);
+  });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
   web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
