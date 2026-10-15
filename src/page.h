@@ -85,19 +85,19 @@ sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allow
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],[s.chip=='ESP32'?'Temp (approx)':'Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort(cmpClients).map(c=>
-`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||c.auto||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none;${!c.name&&c.auto?'font-style:italic':''}" title="${c.name?'set by you':(c.auto?'from the device (click to set your own)':'click to name')}">${c.name?esc(c.name):(c.auto?esc(c.auto):'+ name')}</a>${c.hint?` <span class=tag>${esc(c.hint)}</span>`:''}${c.priv?' <span class=tag title="phone/laptop private Wi-Fi address" style=color:#8b949e>private MAC</span>':''}</td><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||c.auto||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none;${!c.name&&c.auto?'font-style:italic':''}" title="${c.name?'set by you':(c.auto?'from the device (click to set your own)':'click to name')}">${c.name?esc(c.name):(c.auto?esc(c.auto):'+ name')}</a>${c.hint?` <span class=tag>${esc(c.hint)}</span>`:''}${c.priv?' <span class=tag title="phone/laptop private Wi-Fi address" style=color:#8b949e>private MAC</span>':''}</td><td>${c.ip}${(c.ips||[]).length>1?` <span class=tag title="${esc(c.ips.slice(1).join('\n'))}" style=color:#8b949e>+${c.ips.length-1} more</span>`:''}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=lkb data-ip="${esc(c.ip)}">lookups</button> ${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
+<td><button class=lkb data-k="${esc(c.key)}">lookups</button> ${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
 ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
-CUST=s.custom;CL={};s.clients.forEach(c=>CL[c.ip]=(c.name||c.auto||c.ip)+(c.name||c.auto?' ('+c.ip+')':''));
-{let o='<option value="">all devices</option>'+s.clients.map(c=>`<option value="${esc(c.ip)}">${esc(CL[c.ip])}</option>`).join('');
+CUST=s.custom;CL={};ROW={};let RL={};s.clients.forEach(c=>{let l=(c.name||c.auto||c.ip)+(c.name||c.auto?' ('+c.ip+')':'');RL[c.key]=l;(c.ips||[c.ip]).forEach(ip=>{CL[ip]=l;ROW[ip]=c.key})});
+{let o='<option value="">all devices</option>'+s.clients.map(c=>`<option value="${esc(c.key)}">${esc(RL[c.key])}</option>`).join('');
 if(o!=window.QOPT&&document.activeElement!=qcl){let v=qcl.value;qcl.innerHTML=o;qcl.value=v;window.QOPT=o}}
 if(lkd.open&&!document.hidden&&Date.now()-(window.QLAST||0)>5000){window.QLAST=Date.now();loadQ()}
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
-let CL={},QD=[],CUST=[];
+let CL={},ROW={},QD=[],CUST=[];
 // clients table sort: column + direction, remembered in this browser (default: busiest first)
 let SORT={k:'total',d:-1};try{let v=JSON.parse(localStorage.ctsort);if(['name','ip','blocked','allowed','total'].includes(v.k)&&(v.d==1||v.d==-1))SORT=v}catch(_){}
 function ipKey(ip){let p=ip.split('.');return p.length==4?p.reduce((n,x)=>n*256+ +x,0):1e10}
@@ -112,7 +112,7 @@ function ago(s){return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)
 async function loadQ(){try{let r=await fetch('/queries.json',{headers:CSRF_HDRS});if(!r.ok){qmsg.textContent='✗ '+r.status;return}
 QD=(await r.json()).q.sort((a,b)=>a[0]-b[0]);qmsg.textContent=QD.length+' lookups';drawQ()}catch(_){qmsg.textContent='✗ failed'}}
 function drawQ(){let cl=qcl.value,st=qst.value,tx=qtx.value.trim().toLowerCase();
-qt.tBodies[0].innerHTML=QD.filter(q=>(!cl||q[1]==cl)&&(!st||(QS[q[4]]||['',''])[1]==st)&&(!tx||q[2].includes(tx))).map(q=>{let s=QS[q[4]]||[q[4],''],bl=s[1]=='b';
+qt.tBodies[0].innerHTML=QD.filter(q=>(!cl||(ROW[q[1]]||q[1])==cl)&&(!st||(QS[q[4]]||['',''])[1]==st)&&(!tx||q[2].includes(tx))).map(q=>{let s=QS[q[4]]||[q[4],''],bl=s[1]=='b';
 let act=bl?(CUST.includes(q[2])?`<button class=qub data-d="${esc(q[2])}">unblock</button>`:''):`<button class=qbl data-d="${esc(q[2])}">block</button>`;
 return `<tr><td>${ago(q[0])}</td><td>${esc(CL[q[1]]||q[1])}</td><td>${esc(q[2])}</td><td>${QT[q[3]]||q[3]}</td><td class=${s[1]}>${s[0]}</td><td>${act}</td></tr>`}).join('')||'<tr><td colspan=6 style=color:#8b949e>nothing yet</td></tr>'}
 qt.addEventListener('click',e=>{let d=e.target.dataset.d;if(!d)return;
@@ -120,7 +120,7 @@ if(e.target.classList.contains('qbl')&&confirm('Block '+d+' (and its subdomains)
 if(e.target.classList.contains('qub'))fetch('/unblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)})});
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(async r=>{if(r.ok)dom.value='';else alert('✗ '+await r.text());load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('nm')){e.preventDefault();let n=prompt('Name for '+e.target.dataset.k+' (empty = remove)',e.target.dataset.n);if(n!==null)fetch('/setname?k='+encodeURIComponent(e.target.dataset.k)+'&ip='+encodeURIComponent(e.target.dataset.ip)+'&n='+encodeURIComponent(n.trim()),{headers:CSRF_HDRS}).then(load);return}
-if(e.target.classList.contains('lkb')){lkd.open=true;qcl.value=e.target.dataset.ip;loadQ();lkd.scrollIntoView({behavior:'smooth'});return}
+if(e.target.classList.contains('lkb')){lkd.open=true;qcl.value=e.target.dataset.k;loadQ();lkd.scrollIntoView({behavior:'smooth'});return}
 if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
