@@ -17,6 +17,7 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/priv/nd6_priv.h"   // IPv6 neighbor cache, for IPv6 clients' MACs
 #include "lwip/sockets.h"
 #include "esp_netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
@@ -269,20 +270,33 @@ static Dev* getClient(uint32_t ip) {
   }
   return nullptr;
 }
+// IPv6 has no ARP: the MAC comes from lwIP's neighbor cache (only a few entries, so read it
+// right after we answer, while the client's entry is fresh).
+static void getMac6(const uint8_t* a, uint8_t* mac) {
+  memset(mac, 0, 6);
+#if LWIP_IPV6
+  for (int i = 0; i < LWIP_ND6_NUM_NEIGHBORS; i++) {
+    const nd6_neighbor_cache_entry& e = neighbor_cache[i];
+    if (e.state != ND6_NO_ENTRY && !memcmp(e.next_hop_address.addr, a, 16)) { memcpy(mac, e.lladdr, 6); return; }
+  }
+#endif
+}
 // IPv6 clients get their own rows (shown by address; ban is IPv4 only).
 static Dev* getClient6(const uint8_t* a) {
   for (int i = 0; i < numClients; i++) if (clients[i].v6 && !memcmp(clients[i].ip6, a, 16)) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients >= MAX_CLIENTS) return nullptr;
   Dev* c = &clients[numClients++];
   c->v6 = true; c->hint = nullptr; c->nbAskedMs = 0; c->logSlot = -1; c->logPos = 0; memcpy(c->ip6, a, 16); c->ip = 0; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = false; c->label = "";
-  memset(c->mac, 0, 6);
+  getMac6(a, c->mac);
   return c;
 }
-// The MAC is read from the ARP table, which usually has no entry yet when a client's very
-// first query arrives (the reply hasn't been sent). Retry until it's known.
+// The MAC is read from the ARP table (IPv4) or neighbor cache (IPv6), which usually has no
+// entry yet when a client's very first query arrives (the reply hasn't been sent). Retry until it's known.
 static bool macZero(const uint8_t* m) { for (int k = 0; k < 6; k++) if (m[k]) return false; return true; }
 static void refreshMacs() {
-  for (int i = 0; i < numClients; i++) if (!clients[i].v6 && macZero(clients[i].mac)) getMac(clients[i].ip, clients[i].mac);
+  for (int i = 0; i < numClients; i++) if (macZero(clients[i].mac)) {
+    if (clients[i].v6) getMac6(clients[i].ip6, clients[i].mac); else getMac(clients[i].ip, clients[i].mac);
+  }
 }
 
 // Friendly device names set on the dashboard, saved in /names.txt as "key name" lines.
@@ -503,13 +517,13 @@ static void hintFromQuery(Dev* c, const char* d) {
   for (auto& pr : pat) if (strstr(d, pr[0])) { c->hint = pr[1]; return; }
 }
 static String autoHost(const Dev& c) {
-  const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false);
+  const AutoName* a = autoFor(c.mac, false);
   if (!a) return "";
   return String(a->host[0] ? a->host : a->mdns[0] ? a->mdns : a->nb);
 }
 static String autoHint(const Dev& c) {
   if (c.hint) return c.hint;
-  const AutoName* a = c.v6 ? nullptr : autoFor(c.mac, false);
+  const AutoName* a = autoFor(c.mac, false);
   if (a && a->vend[0]) {
     if (!strncmp(a->vend, "android", 7)) return "Android";
     if (!strncmp(a->vend, "MSFT", 4)) return "Windows";
@@ -785,8 +799,10 @@ static bool handleDns() {
     did = true;
     if (qlen < 13) continue;
     queries6++;
-    int rlen = answerQuery(qlen, getClient6(from.sin6_addr.s6_addr));
+    Dev* c = getClient6(from.sin6_addr.s6_addr);
+    int rlen = answerQuery(qlen, c);
     if (rlen > 0) sendto(dns6, buf, rlen, 0, (struct sockaddr*)&from, fl);
+    if (c && macZero(c->mac)) getMac6(c->ip6, c->mac);
   }
   return did;
 }
@@ -852,7 +868,7 @@ static void handleStats() {
     if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); ip6addr_ntoa_r(&a6, t6, sizeof(t6)); }
     String ips = c.v6 ? String(t6) : ip.toString(), ms = macStr(c.mac);
     String key = macZero(c.mac) ? ips : ms;
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"auto\":\"" + jesc(autoHost(c)) + "\",\"hint\":\"" + jesc(autoHint(c)) + "\",\"priv\":" + ((!c.v6 && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"auto\":\"" + jesc(autoHost(c)) + "\",\"hint\":\"" + jesc(autoHint(c)) + "\",\"priv\":" + ((!macZero(c.mac) && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
