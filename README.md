@@ -194,6 +194,7 @@ Build with `-DDASHBOARD_OPEN` to keep the view open as before. State-changing en
 also need the `X-Requested-With: c3-adblock` header (CSRF guard):
 
 - `/ban`, `/addblock`, `/unblock`, `/forgetwifi`, `/pause`, `/resume`
+- `/reboot`, `/resetstats`, `/resetsettings?c=RESET`, `/export.json`
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`, `/setdns`, `/setname`, `/queries.json`
 
