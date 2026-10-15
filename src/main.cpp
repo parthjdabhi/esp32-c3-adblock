@@ -737,13 +737,22 @@ static void logLookup(Dev* c, const char* name, uint16_t qtype, char st) {
 // Drops anything that isn't a plain standard query (idea from upstream PR #26): replies
 // (QR set, e.g. a reflected packet), other opcodes, not exactly one question, or a class
 // other than IN (CHAOS "version.bind" probes etc.). Those are never forwarded.
+// Bans are saved by IPv4 address. A banned device that asks over IPv6 (or from a second
+// IPv4 address) is matched by MAC, so it can't skip the ban that way.
+static bool devBanned(const Dev* c) {
+  if (!c) return false;
+  if (c->banned) return true;
+  if (macZero(c->mac)) return false;
+  for (int i = 0; i < numClients; i++) if (clients[i].banned && !memcmp(clients[i].mac, c->mac, 6)) return true;
+  return false;
+}
 static int answerQuery(int qlen, Dev* c) {
   if (qlen < 17 || (buf[2] & 0x80) || ((buf[2] >> 3) & 0x0F) != 0 || buf[4] != 0 || buf[5] != 1) { droppedQueries++; return 0; }
   char domain[256]; uint16_t qtype = 0; int qend = qlen;
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
   if (dl && (buf[qend - 2] != 0 || buf[qend - 1] != 1)) { droppedQueries++; return 0; }
   if (dl) hintFromQuery(c, domain);
-  bool ban = c && c->banned;
+  bool ban = devBanned(c);
   bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
   int rlen;
   // log status: b = blocked by list/custom, n = client banned, c = from cache, f = forwarded, x = no answer
@@ -847,6 +856,11 @@ static String htmlEscape(const String& s) {
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
+static String devIp(const Dev& c) {
+  if (!c.v6) return IPAddress(c.ip).toString();
+  ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); char t6[48]; ip6addr_ntoa_r(&a6, t6, sizeof(t6));
+  return String(t6);
+}
 static void handleStats() {
   refreshMacs();
   uint32_t up = millis() / 1000;
@@ -863,12 +877,28 @@ static void handleStats() {
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
-  for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    char t6[48] = "";
-    if (c.v6) { ip6_addr_t a6; memset(&a6, 0, sizeof(a6)); memcpy(a6.addr, c.ip6, 16); ip6addr_ntoa_r(&a6, t6, sizeof(t6)); }
-    String ips = c.v6 ? String(t6) : ip.toString(), ms = macStr(c.mac);
-    String key = macZero(c.mac) ? ips : ms;
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ips + "\",\"name\":\"" + jesc(nameOf(ms, ips)) + "\",\"auto\":\"" + jesc(autoHost(c)) + "\",\"hint\":\"" + jesc(autoHint(c)) + "\",\"priv\":" + ((!macZero(c.mac) && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+  // One row per device: entries with the same MAC (IPv4 + IPv6, or an old IPv4 address) are
+  // joined, counts summed. The row shows the newest IPv4 address; "ips" lists all of them.
+  static bool shown[MAX_CLIENTS]; memset(shown, 0, sizeof(shown));
+  bool firstRow = true;
+  for (int i = 0; i < numClients; i++) { if (shown[i]) continue;
+    const bool hasMac = !macZero(clients[i].mac);
+    int p = i; uint32_t blk = 0, alw = 0; String hint, autoN;
+    for (int k = i; k < numClients; k++) {
+      if (shown[k] || (k != i && (!hasMac || memcmp(clients[k].mac, clients[i].mac, 6)))) continue;
+      const Dev& d = clients[k]; shown[k] = true; blk += d.blocked; alw += d.allowed;
+      if (!hint.length()) hint = autoHint(d);
+      if (!autoN.length()) autoN = autoHost(d);
+      const Dev& b = clients[p];
+      if ((b.v6 && !d.v6) || (b.v6 == d.v6 && (int32_t)(d.lastSeen - b.lastSeen) > 0)) p = k;   // prefer IPv4, then newest
+    }
+    const Dev& c = clients[p]; String ms = macStr(c.mac), ips = devIp(c), all = "\"" + ips + "\"", name = nameOf(ms, ips);
+    for (int k = i; k < numClients; k++) if (k != p && hasMac && !memcmp(clients[k].mac, c.mac, 6)) {
+      String o = devIp(clients[k]); all += ",\"" + o + "\""; if (!name.length()) name = nameOf(ms, o);
+    }
+    String key = hasMac ? ms : ips;
+    j += firstRow ? "" : ","; firstRow = false;
+    j += "{\"ip\":\"" + ips + "\",\"ips\":[" + all + "],\"name\":\"" + jesc(name) + "\",\"auto\":\"" + jesc(autoN) + "\",\"hint\":\"" + jesc(hint) + "\",\"priv\":" + ((hasMac && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + blk + ",\"allowed\":" + alw + ",\"banned\":" + (devBanned(&c)?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
