@@ -193,7 +193,8 @@ including just viewing it (`/`, `/stats.json`), since it shows device names, MAC
 Build with `-DDASHBOARD_OPEN` to keep the view open as before. State-changing endpoints
 also need the `X-Requested-With: c3-adblock` header (CSRF guard):
 
-- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`, `/pause`, `/resume`
+- `/ban`, `/addblock`, `/unblock`, `/addallow`, `/unallow`, `/forgetwifi`, `/pause`, `/resume`
+- `/devpause?k=<mac or ip>&ip=<ip>&s=<seconds>` (0 = until resumed), `/devresume?k=<mac or ip>&ip=<ip>`
 - `/reboot`, `/resetstats`, `/resetsettings?c=RESET`, `/export.json`
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`, `/setdns`, `/setname`, `/queries.json`
@@ -269,6 +270,7 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 ## Done / how it could grow
 
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
+- ✅ Allowlist (wins over the blocklist and custom blocks) and pause blocking for one device
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
 - ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer

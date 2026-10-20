@@ -1,7 +1,8 @@
 // C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
 // Dashboard at http://c3adblock.local : per-client stats, system info,
-// ban clients, add custom block domains. All control state persisted to flash.
+// ban clients, add custom block / allow domains, pause blocking per device.
+// All control state persisted to flash.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -80,8 +81,12 @@ struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; b
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
-static const int MAX_CUSTOM = 200;
-String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
+// Domain lists set on the dashboard: custom blocks and the allowlist (allow wins over any block).
+struct DomList { const char* path; int max; String* dom; uint64_t* hash; int n; };
+static const int MAX_CUSTOM = 200, MAX_ALLOW = 100;
+String customDom[MAX_CUSTOM], allowDom[MAX_ALLOW]; uint64_t customHash[MAX_CUSTOM], allowHash[MAX_ALLOW];
+DomList custom = { "/custom.txt", MAX_CUSTOM, customDom, customHash, 0 };
+DomList allow  = { "/allow.txt",  MAX_ALLOW,  allowDom,  allowHash,  0 };
 
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
@@ -163,13 +168,13 @@ static bool inFlash(uint64_t h) {
   return false;
 }
 
-static bool inCustom(uint64_t h) { for (int i = 0; i < numCustom; i++) if (customHash[i] == h) return true; return false; }
+static bool inList(const DomList& L, uint64_t h) { for (int i = 0; i < L.n; i++) if (L.hash[i] == h) return true; return false; }
 
 // Only flash results are cached: the flash list only changes via reopenBlocklist(), which
 // rebuilds the index and clears the cache. Custom domains change at runtime, so they're
 // checked uncached (a short linear scan) to avoid serving stale answers.
 static bool isBlockedHash(uint64_t h) {
-  if (inCustom(h)) return true;
+  if (inList(custom, h)) return true;
   uint32_t slot = h & (CACHE_SIZE - 1);
   if (cacheValid[slot]) {
     uint8_t want[HASH_BYTES]; packHash(h, want);
@@ -194,6 +199,15 @@ static bool isBlocked(const char* domain) {
   }
   return false;
 }
+// Same parent walk as isBlocked: "example.com" on the allowlist also allows "cdn.example.com".
+static bool isAllowed(const char* domain) {
+  for (const char* p = domain; allow.n && p && *p; ) {
+    if (inList(allow, fnv40(p, strlen(p)))) return true;
+    const char* dot = strchr(p, '.'); if (!dot) break;
+    const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
+  }
+  return false;
+}
 
 // ---------- persistence ----------
 // Turn what people paste into a bare domain: "https://Max.AppLovin.com/p/x?id=1" ->
@@ -212,32 +226,34 @@ static String normDomain(String d) {
   for (char ch : d) if (!(isalnum((unsigned char)ch) || ch == '.' || ch == '-' || ch == '_')) return "";
   return d;
 }
-static void saveCustom();
-static void loadCustom() {
+static void saveList(const DomList& L) { File f = LittleFS.open(L.path, "w"); if (!f) return; for (int i = 0; i < L.n; i++) f.println(L.dom[i]); f.close(); }
+static bool listHas(const DomList& L, const String& d) { for (int i = 0; i < L.n; i++) if (L.dom[i] == d) return true; return false; }
+static void loadList(DomList& L) {
   bool changed = false;
-  numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
-  while (f.available() && numCustom < MAX_CUSTOM) {
+  L.n = 0; File f = LittleFS.open(L.path, "r"); if (!f) return;
+  while (f.available() && L.n < L.max) {
     String raw = f.readStringUntil('\n'); raw.trim();
     String l = normDomain(raw);
-    bool dup = false; for (int i = 0; i < numCustom; i++) if (customDom[i] == l) dup = true;
-    if (l.length() && !dup) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    bool dup = listHas(L, l);
+    if (l.length() && !dup) { L.dom[L.n] = l; L.hash[L.n] = fnv40(l.c_str(), l.length()); L.n++; }
     if (raw.length() && (l != raw || dup)) changed = true;   // e.g. an old "*.x.com" entry
   }
   f.close();
-  if (changed) saveCustom();
+  if (changed) saveList(L);
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
-static bool addCustom(String d) {
+// false = not a domain, or the list is full (already listed counts as success)
+static bool addToList(DomList& L, String d) {
   d = normDomain(d);
-  if (!d.length() || numCustom >= MAX_CUSTOM) return false;
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+  if (!d.length()) return false;
+  if (listHas(L, d)) return true;
+  if (L.n >= L.max) return false;
+  L.dom[L.n] = d; L.hash[L.n] = fnv40(d.c_str(), d.length()); L.n++; saveList(L); return true;
 }
-static void removeCustom(String d) {
+static void removeFromList(DomList& L, String d) {
   d.trim(); d.toLowerCase();
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
-    for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
+  for (int i = 0; i < L.n; i++) if (L.dom[i] == d) {
+    for (int j = i; j < L.n - 1; j++) { L.dom[j] = L.dom[j+1]; L.hash[j] = L.hash[j+1]; }
+    L.n--; saveList(L); return;
   }
 }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
@@ -537,6 +553,71 @@ static String nameOf(const String& mac, const String& ip) {
   return "";
 }
 
+// ---------- per-device pause ----------
+// Blocking is skipped for a paused device (its own lookups only, bans still apply). Matched
+// by MAC when known (survives IP changes), else by IPv4 address: the clients table row key.
+// until = millis() to resume, 0 = until resumed. Only the "until resumed" ones are saved.
+struct DevPause { uint8_t mac[6]; uint32_t ip; uint32_t until; };
+static const int MAX_PAUSE = 32;
+DevPause devPauses[MAX_PAUSE]; int numPauses = 0;
+static bool parseDevKey(const String& key, uint8_t* mac, uint32_t* ip) {
+  memset(mac, 0, 6); *ip = 0;
+  unsigned m[6];
+  if (key.length() == 17 && sscanf(key.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+    for (int k = 0; k < 6; k++) mac[k] = (uint8_t)m[k];
+    return !macZero(mac);
+  }
+  IPAddress a; if (a.fromString(key) && (uint32_t)a) { *ip = (uint32_t)a; return true; }
+  return false;
+}
+static String devKeyStr(const DevPause& p) { return macZero(p.mac) ? IPAddress(p.ip).toString() : macStr(p.mac); }
+static void savePauses() {
+  File f = LittleFS.open("/paused.txt", "w"); if (!f) return;
+  for (int i = 0; i < numPauses; i++) if (!devPauses[i].until) f.println(devKeyStr(devPauses[i]));
+  f.close();
+}
+static void loadPauses() {
+  numPauses = 0; File f = LittleFS.open("/paused.txt", "r"); if (!f) return;
+  while (f.available() && numPauses < MAX_PAUSE) {
+    String l = f.readStringUntil('\n'); l.trim(); DevPause& p = devPauses[numPauses];
+    if (parseDevKey(l, p.mac, &p.ip)) { p.until = 0; numPauses++; }
+  }
+  f.close();
+}
+// secs > 0 = pause for that long, 0 = until resumed, < 0 = resume. false = bad key or table full.
+// alt = the device's IPv4 address when key is its MAC, so a pause saved before the MAC was
+// known is replaced or resumed too (same idea as setName).
+static bool setDevPause(const String& key, const String& alt, long secs) {
+  uint8_t mac[6]; uint32_t ip; if (!parseDevKey(key, mac, &ip)) return false;
+  uint8_t amac[6]; uint32_t aip;
+  if (alt != key && parseDevKey(alt, amac, &aip) && aip)
+    for (int i = 0; i < numPauses; ) if (macZero(devPauses[i].mac) && devPauses[i].ip == aip) devPauses[i] = devPauses[--numPauses]; else i++;
+  if (secs > 7 * 86400L) secs = 7 * 86400L;   // keeps millis() math well inside int32
+  int at = -1;
+  for (int i = 0; i < numPauses; i++) if (!memcmp(devPauses[i].mac, mac, 6) && devPauses[i].ip == ip) at = i;
+  if (secs < 0) { if (at >= 0) devPauses[at] = devPauses[--numPauses]; }
+  else {
+    if (at < 0) { if (numPauses >= MAX_PAUSE) return false; at = numPauses++; memcpy(devPauses[at].mac, mac, 6); devPauses[at].ip = ip; }
+    devPauses[at].until = secs ? (millis() + (uint32_t)secs * 1000UL) | 1 : 0;   // | 1: 0 means "until resumed"
+  }
+  savePauses(); return true;
+}
+static void expirePauses() {
+  for (int i = 0; i < numPauses; )
+    if (devPauses[i].until && (int32_t)(millis() - devPauses[i].until) >= 0) devPauses[i] = devPauses[--numPauses]; else i++;
+}
+// -1 = not paused, 0 = paused until resumed, else seconds left
+static long pauseLeft(const Dev* c) {
+  if (!c) return -1;
+  for (int i = 0; i < numPauses; i++) { const DevPause& p = devPauses[i];
+    if (macZero(p.mac) ? (c->v6 || p.ip != c->ip) : memcmp(p.mac, c->mac, 6)) continue;
+    if (!p.until) return 0;
+    int32_t ms = (int32_t)(p.until - millis());
+    return ms > 0 ? (ms + 999) / 1000 : -1;
+  }
+  return -1;
+}
+
 // ---------- DNS ----------
 static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype, int* qend) {
   if (len < 13) return 0; int i = 12; size_t o = 0;
@@ -753,7 +834,7 @@ static int answerQuery(int qlen, Dev* c) {
   if (dl && (buf[qend - 2] != 0 || buf[qend - 1] != 1)) { droppedQueries++; return 0; }
   if (dl) hintFromQuery(c, domain);
   bool ban = devBanned(c);
-  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+  bool blocked = ban || (blockingOn && dl && numHashes && pauseLeft(c) < 0 && isBlocked(domain) && !isAllowed(domain));
   int rlen;
   // log status: b = blocked by list/custom, n = client banned, c = from cache, f = forwarded, x = no answer
   char st;
@@ -833,6 +914,7 @@ static String ip6List() {
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
 static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
+static String jsonList(const DomList& L) { String j = "["; for (int i = 0; i < L.n; i++) { j += (i ? "," : ""); j += "\"" + jesc(L.dom[i]) + "\""; } return j + "]"; }
 // HTML text/attribute escaping for the setup portal. jesc() covers JSON (stats
 // endpoint); the portal builds HTML, and its inputs — a scanned SSID, the
 // submitted WiFi name — are attacker-controllable during provisioning (the
@@ -898,10 +980,8 @@ static void handleStats() {
     }
     String key = hasMac ? ms : ips;
     j += firstRow ? "" : ","; firstRow = false;
-    j += "{\"ip\":\"" + ips + "\",\"ips\":[" + all + "],\"name\":\"" + jesc(name) + "\",\"auto\":\"" + jesc(autoN) + "\",\"hint\":\"" + jesc(hint) + "\",\"priv\":" + ((hasMac && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + blk + ",\"allowed\":" + alw + ",\"banned\":" + (devBanned(&c)?"true":"false") + "}"; }
-  j += "],\"custom\":[";
-  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
-  j += "]}";
+    j += "{\"ip\":\"" + ips + "\",\"ips\":[" + all + "],\"name\":\"" + jesc(name) + "\",\"auto\":\"" + jesc(autoN) + "\",\"hint\":\"" + jesc(hint) + "\",\"priv\":" + ((hasMac && (c.mac[0] & 0x02)) ? "true" : "false") + ",\"key\":\"" + key + "\",\"mac\":\"" + ms + "\",\"blocked\":" + blk + ",\"allowed\":" + alw + ",\"banned\":" + (devBanned(&c)?"true":"false") + ",\"paused\":" + pauseLeft(&c) + "}"; }
+  j += "],\"custom\":" + jsonList(custom) + ",\"allow\":" + jsonList(allow) + "}";
   web.send(200, "application/json", j);
 }
 // Upstream shipped every state-changing/OTA endpoint with zero authentication —
@@ -1278,8 +1358,8 @@ void setup() {
   Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION);
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   reopenBlocklist();
-  loadCustom(); loadBanned(); loadUpdateCfg(); loadDnsCfg(); loadNames(); loadAuto();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  loadList(custom); loadList(allow); loadBanned(); loadPauses(); loadUpdateCfg(); loadDnsCfg(); loadNames(); loadAuto();
+  Serial.printf("custom: %d, allowed: %d, banned: %d, paused: %d\n", custom.n, allow.n, numBanned, numPauses);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -1319,9 +1399,27 @@ void setup() {
     if (!requireAuth()) return;
     String d = normDomain(web.arg("d"));
     if (!d.length()) { web.send(400, "text/plain", "not a domain"); return; }
-    addCustom(d); web.send(200, "text/plain", d);
+    removeFromList(allow, d);
+    if (!addToList(custom, d)) { web.send(400, "text/plain", "block list is full"); return; }
+    web.send(200, "text/plain", d);
   });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/unblock", []() { if (!requireAuth()) return; removeFromList(custom, web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addallow", []() {
+    if (!requireAuth()) return;
+    String d = normDomain(web.arg("d"));
+    if (!d.length()) { web.send(400, "text/plain", "not a domain"); return; }
+    removeFromList(custom, d);
+    if (!addToList(allow, d)) { web.send(400, "text/plain", "allow list is full"); return; }
+    web.send(200, "text/plain", d);
+  });
+  web.on("/unallow", []() { if (!requireAuth()) return; removeFromList(allow, web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/devpause", []() {                 // /devpause?k=<mac or ip>&ip=<ip>&s=1800  (0 or absent = until resumed)
+    if (!requireAuth()) return;
+    long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
+    if (setDevPause(web.arg("k"), web.arg("ip"), s < 0 ? 0 : s)) web.send(200, "text/plain", "paused");
+    else web.send(400, "text/plain", "unknown device, or too many paused devices");
+  });
+  web.on("/devresume", []() { if (!requireAuth()) return; setDevPause(web.arg("k"), web.arg("ip"), -1); web.send(200, "text/plain", "resumed"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
@@ -1344,18 +1442,18 @@ void setup() {
   web.on("/resetsettings", []() {        // ?c=RESET  saved settings back to defaults; WiFi + blocklist stay
     if (!requireAuth()) return;
     if (web.arg("c") != "RESET") { web.send(400, "text/plain", "confirm with c=RESET"); return; }
-    for (const char* p : { "/custom.txt", "/banned.txt", "/names.txt", "/autonames.txt", "/dns.cfg", "/update.cfg" }) LittleFS.remove(p);
+    for (const char* p : { "/custom.txt", "/allow.txt", "/banned.txt", "/paused.txt", "/names.txt", "/autonames.txt", "/dns.cfg", "/update.cfg" }) LittleFS.remove(p);
     web.send(200, "text/plain", "settings cleared, rebooting");
     Serial.println("[web] settings reset"); delay(500); ESP.restart();
   });
   web.on("/export.json", []() {          // backup of everything /resetsettings clears (except learned names)
     if (!requireAuth()) return;
-    String j = "{\"ver\":\"" FW_VERSION "\",\"custom\":[";
-    for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
-    j += "],\"names\":[";
+    String j = "{\"ver\":\"" FW_VERSION "\",\"custom\":" + jsonList(custom) + ",\"allow\":" + jsonList(allow) + ",\"names\":[";
     for (int i = 0; i < numNames; i++) { j += (i ? "," : ""); j += "[\"" + jesc(nameKey[i]) + "\",\"" + jesc(nameVal[i]) + "\"]"; }
     j += "],\"banned\":[";
     for (int i = 0; i < numBanned; i++) { j += (i ? "," : ""); j += "\"" + IPAddress(bannedIP[i]).toString() + "\""; }
+    j += "],\"paused\":[";
+    for (int i = 0, n = 0; i < numPauses; i++) if (!devPauses[i].until) { j += (n++ ? "," : ""); j += "\"" + devKeyStr(devPauses[i]) + "\""; }
     j += "],\"dns\":[\"" + upDns[0].toString() + "\",\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"]" +
          ",\"update\":{\"url\":\"" + jesc(updateUrl) + "\",\"hours\":" + updateIntervalH + "}}";
     web.send(200, "application/json", j);
@@ -1426,6 +1524,7 @@ void loop() {
   bool busy = handleDns();
   handleDhcpSniff(); handleNetbios(); askNames();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
+  expirePauses();
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
