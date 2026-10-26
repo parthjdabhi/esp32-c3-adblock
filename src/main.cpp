@@ -16,6 +16,7 @@
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include "lwip/dns.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "lwip/priv/nd6_priv.h"   // IPv6 neighbor cache, for IPv6 clients' MACs
@@ -1192,8 +1193,19 @@ static bool sameAsLive(const uint8_t* h) {
   if (f) f.close();
   return same;
 }
+// The router hands this device out as everyone's DNS, the ESP32 included. Its own lookup for the
+// fetch can't be answered while the loop is stuck in that fetch (HTTP -1), so ask upstream instead.
+// Set before every fetch because a DHCP renew puts the router's DNS back.
+static void useUpstreamForOwnLookups() {
+  for (int i = 0; i < 2; i++) {
+    IPAddress a = (uint32_t)upDns[i] ? upDns[i] : upDns[0];
+    ip_addr_t d; d.type = IPADDR_TYPE_V4; d.u_addr.ip4.addr = (uint32_t)a;
+    dns_setserver(i, &d);
+  }
+}
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  useUpstreamForOwnLookups();
   Serial.printf("[remote] GET %s\n", url.c_str());
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
