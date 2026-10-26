@@ -11,8 +11,8 @@ Usage: build_blocklist.py [--raw] [out.bin] [src ...]
   + the sorted hashes, so the device can reject a corrupt or random file. --raw writes
   just the hashes, for firmware older than the header change.
   src = local file or URL. With none given, downloads a balanced daily-driver set
-  (StevenBlack base + AdGuard DNS filter) ~= 230k entries: blocks ads/trackers/malware
-  but leaves WhatsApp/Instagram/social/messaging working.
+  (StevenBlack base + AdGuard DNS filter + YouTube ad hosts) ~= 240k entries: blocks
+  ads/trackers/malware but leaves WhatsApp/Instagram/social/messaging working.
 
   For the aggressive "test the limits" build (~500k, also blocks social/messaging):
     build_blocklist.py blocklist.bin \\
@@ -33,9 +33,12 @@ U64 = (1 << 64) - 1
 # AdGuard DNS filter covers far more ad/tracker domains than Hagezi Light (~98% vs ~71% of
 # AdGuard's mobile-ads list, ~99% vs ~20% of EasyList's domain rules) and still fits.
 # Hagezi Light alone (~57k) is the lighter option if flash is tight.
+# The YouTube list (~16k r?---sn-xxxx.googlevideo.com hosts that only serve ads) is updated
+# daily upstream. Use black.list, not crowed_list.txt: the crowd list also hits real video hosts.
 DEFAULT_SOURCES = [
     'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',            # base: ads + malware
     'https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt',          # AdGuard DNS filter (||domain^ rules)
+    'https://raw.githubusercontent.com/kboghdady/youTube_ads_4_pi-hole/master/black.list',  # YouTube video ad hosts
 ]
 
 # ||domain^  or  @@||domain^  optionally followed by $modifiers
