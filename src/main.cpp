@@ -1184,6 +1184,14 @@ static void saveDnsCfg() {
   File f = LittleFS.open("/dns.cfg", "w"); if (!f) return;
   f.println(upDns[0].toString()); f.println(upDns[1].toString()); f.close();
 }
+// true when the downloaded C3BL header (count + CRC) equals the live list's, i.e. same list.
+static bool sameAsLive(const uint8_t* h) {
+  if (!numHashes || blOffset != BL_HDR) return false;   // only a checked v1 list has a CRC to compare
+  File f = LittleFS.open(BLOCKLIST_PATH, "r"); uint8_t cur[BL_HDR];
+  bool same = f && f.read(cur, BL_HDR) == BL_HDR && !memcmp(cur, h, BL_HDR);
+  if (f) f.close();
+  return same;
+}
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
@@ -1195,11 +1203,24 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  WiFiClient* stream = http.getStreamPtr();
+  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  // Read the header first. The swap deletes the live list before the download (no room for
+  // two), so an unchanged list would only cost a no-blocking gap and a 1 MB flash write.
+  uint8_t hdr[BL_HDR];
+  while (total < BL_HDR && http.connected() && millis() - idle < 15000) {
+    if (stream->available()) { int n = stream->readBytes(hdr + total, BL_HDR - total); if (n > 0) { total += n; idle = millis(); } }
+    else delay(2);
+  }
+  if (total == BL_HDR && sameAsLive(hdr)) {
+    http.end(); updateStatus = "no change: " + String(numHashes) + " domains";
+    Serial.printf("[remote] %s\n", updateStatus.c_str());
+    return true;
+  }
   beginBlocklistSwap();
   File f = LittleFS.open("/blocklist.new", "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
-  WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  f.write(hdr, total);
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
