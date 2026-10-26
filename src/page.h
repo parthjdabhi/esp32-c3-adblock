@@ -36,6 +36,10 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com or a URL" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
+<h2>ALLOWED DOMAINS</h2>
+<div style=margin-bottom:8px><input id=adom placeholder="app.example.com or a URL" size=30><button onclick=addAllow()>Allow domain</button></div>
+<table id=al><tbody></tbody></table>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">never blocked, for every device (subdomains too). Wins over the blocklist and custom blocks. A device may keep its old blocked answer for up to 5 minutes.</div>
 <h2>BLOCKLIST &mdash; UPLOAD</h2>
 <form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
@@ -59,10 +63,10 @@ If your router hands out its own IPv6 DNS, devices can skip the blocker: in the 
 <div style=margin-bottom:6px><button onclick="if(confirm('Restart the device? DNS stops for about 10 seconds.'))reboot()">Restart</button>
 <button onclick="if(confirm('Set all blocked/allowed counters to zero and clear recent lookups?'))resetStats()">Reset stats</button>
 <button onclick=exportCfg()>Export settings</button> <span id=devmsg></span></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">restart keeps everything. Reset stats only clears counters and lookups. Export downloads custom domains, names, bans, DNS and auto-update as a JSON file.</div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">restart keeps everything. Reset stats only clears counters and lookups. Export downloads custom and allowed domains, names, bans, paused devices, DNS and auto-update as a JSON file.</div>
 <h2 style=color:#f85149>DANGER ZONE</h2>
 <div style=margin-bottom:6px><button class=ban onclick=resetSettings()>Reset settings</button></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">clears custom blocked domains, bans, device names (yours and learned), upstream DNS and auto-update, then restarts. WiFi and the blocklist stay. Export first.</div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">clears custom blocked and allowed domains, bans, paused devices, device names (yours and learned), upstream DNS and auto-update, then restarts. WiFi and the blocklist stay. Export first.</div>
 </div><script>
 function fmt(n){return n.toLocaleString()}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -84,20 +88,22 @@ pausebtn.textContent=on?'Pause':'Resume';pausedur.style.display=on?'':'none';
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['From cache',fmt(s.cachehits||0),'a'],['Blocklist',fmt(s.domains)+' domains<div class=l>'+esc(s.blformat||'')+'</div>',''],
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],[s.chip=='ESP32'?'Temp (approx)':'Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort(cmpClients).map(c=>
-`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||c.auto||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none;${!c.name&&c.auto?'font-style:italic':''}" title="${c.name?'set by you':(c.auto?'from the device (click to set your own)':'click to name')}">${c.name?esc(c.name):(c.auto?esc(c.auto):'+ name')}</a>${c.hint?` <span class=tag>${esc(c.hint)}</span>`:''}${c.priv?' <span class=tag title="phone/laptop private Wi-Fi address" style=color:#8b949e>private MAC</span>':''}</td><td>${c.ip}${(c.ips||[]).length>1?` <span class=tag title="${esc(c.ips.slice(1).join('\n'))}" style=color:#8b949e>+${c.ips.length-1} more</span>`:''}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+if(!document.activeElement?.classList.contains('dps')){ct.tBodies[0].innerHTML=s.clients.sort(cmpClients).map(c=>
+`<tr><td><a href=# class=nm data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" data-n="${esc(c.name||c.auto||'')}" style="color:${c.name?'#c9d1d9':'#8b949e'};text-decoration:none;${!c.name&&c.auto?'font-style:italic':''}" title="${c.name?'set by you':(c.auto?'from the device (click to set your own)':'click to name')}">${c.name?esc(c.name):(c.auto?esc(c.auto):'+ name')}</a>${c.hint?` <span class=tag>${esc(c.hint)}</span>`:''}${c.priv?' <span class=tag title="phone/laptop private Wi-Fi address" style=color:#8b949e>private MAC</span>':''}</td><td>${c.ip}${(c.ips||[]).length>1?` <span class=tag title="${esc(c.ips.slice(1).join('\n'))}" style=color:#8b949e>+${c.ips.length-1} more</span>`:''}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}${c.paused>=0?` <span class=tag style=color:#f0883e title="ad blocking is off for this device">PAUSED${c.paused>0?' '+ago(c.paused):''}</span>`:''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=lkb data-k="${esc(c.key)}">lookups</button> ${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('');
+<td><button class=lkb data-k="${esc(c.key)}">lookups</button> ${c.ip.includes(':')?'':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}
+${c.key==c.mac||!c.key.includes(':')?(c.paused>=0?`<button class=dres data-k="${esc(c.key)}" data-ip="${esc(c.ip)}">Resume</button>`:`<select class=dps data-k="${esc(c.key)}" data-ip="${esc(c.ip)}" title="pause ad blocking for this device"><option value="">Pause</option><option value=1800>30 min</option><option value=3600>1 hour</option><option value=14400>4 hours</option><option value=0>until resumed</option></select>`):''}</td></tr>`).join('');}
 ip6.textContent=(s.ip6&&s.ip6.length)?s.ip6.join('  '):'none yet (the router may not offer IPv6)';q6.textContent=fmt(s.q6||0);
-CUST=s.custom;CL={};ROW={};let RL={};s.clients.forEach(c=>{let l=(c.name||c.auto||c.ip)+(c.name||c.auto?' ('+c.ip+')':'');RL[c.key]=l;(c.ips||[c.ip]).forEach(ip=>{CL[ip]=l;ROW[ip]=c.key})});
+CUST=s.custom;ALW=s.allow||[];CL={};ROW={};let RL={};s.clients.forEach(c=>{let l=(c.name||c.auto||c.ip)+(c.name||c.auto?' ('+c.ip+')':'');RL[c.key]=l;(c.ips||[c.ip]).forEach(ip=>{CL[ip]=l;ROW[ip]=c.key})});
 {let o='<option value="">all devices</option>'+s.clients.map(c=>`<option value="${esc(c.key)}">${esc(RL[c.key])}</option>`).join('');
 if(o!=window.QOPT&&document.activeElement!=qcl){let v=qcl.value;qcl.innerHTML=o;qcl.value=v;window.QOPT=o}}
 if(lkd.open&&!document.hidden&&Date.now()-(window.QLAST||0)>5000){window.QLAST=Date.now();loadQ()}
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+al.tBodies[0].innerHTML=ALW.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmal data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
-let CL={},ROW={},QD=[],CUST=[];
+let CL={},ROW={},QD=[],CUST=[],ALW=[];
 // clients table sort: column + direction, remembered in this browser (default: busiest first)
 let SORT={k:'total',d:-1};try{let v=JSON.parse(localStorage.ctsort);if(['name','ip','blocked','allowed','total'].includes(v.k)&&(v.d==1||v.d==-1))SORT=v}catch(_){}
 function ipKey(ip){let p=ip.split('.');return p.length==4?p.reduce((n,x)=>n*256+ +x,0):1e10}
@@ -113,16 +119,24 @@ async function loadQ(){try{let r=await fetch('/queries.json',{headers:CSRF_HDRS}
 QD=(await r.json()).q.sort((a,b)=>a[0]-b[0]);qmsg.textContent=QD.length+' lookups';drawQ()}catch(_){qmsg.textContent='✗ failed'}}
 function drawQ(){let cl=qcl.value,st=qst.value,tx=qtx.value.trim().toLowerCase();
 qt.tBodies[0].innerHTML=QD.filter(q=>(!cl||(ROW[q[1]]||q[1])==cl)&&(!st||(QS[q[4]]||['',''])[1]==st)&&(!tx||q[2].includes(tx))).map(q=>{let s=QS[q[4]]||[q[4],''],bl=s[1]=='b';
-let act=bl?(CUST.includes(q[2])?`<button class=qub data-d="${esc(q[2])}">unblock</button>`:''):`<button class=qbl data-d="${esc(q[2])}">block</button>`;
+let act=bl?(CUST.includes(q[2])?`<button class=qub data-d="${esc(q[2])}">unblock</button>`:q[4]=='b'?`<button class=qal data-d="${esc(q[2])}">allow</button>`:'')
+:ALW.includes(q[2])?`<button class=qua data-d="${esc(q[2])}">unallow</button>`:`<button class=qbl data-d="${esc(q[2])}">block</button>`;
 return `<tr><td>${ago(q[0])}</td><td>${esc(CL[q[1]]||q[1])}</td><td>${esc(q[2])}</td><td>${QT[q[3]]||q[3]}</td><td class=${s[1]}>${s[0]}</td><td>${act}</td></tr>`}).join('')||'<tr><td colspan=6 style=color:#8b949e>nothing yet</td></tr>'}
 qt.addEventListener('click',e=>{let d=e.target.dataset.d;if(!d)return;
 if(e.target.classList.contains('qbl')&&confirm('Block '+d+' (and its subdomains) for everyone?'))fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)});
-if(e.target.classList.contains('qub'))fetch('/unblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)})});
+if(e.target.classList.contains('qub'))fetch('/unblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)});
+if(e.target.classList.contains('qal')&&confirm('Allow '+d+' (and its subdomains) for everyone?'))fetch('/addallow?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)});
+if(e.target.classList.contains('qua'))fetch('/unallow?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{load();setTimeout(loadQ,300)})});
+function addAllow(){let d=adom.value.trim();if(d){fetch('/addallow?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(async r=>{if(r.ok)adom.value='';else alert('✗ '+await r.text());load()})}}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(async r=>{if(r.ok)dom.value='';else alert('✗ '+await r.text());load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('nm')){e.preventDefault();let n=prompt('Name for '+e.target.dataset.k+' (empty = remove)',e.target.dataset.n);if(n!==null)fetch('/setname?k='+encodeURIComponent(e.target.dataset.k)+'&ip='+encodeURIComponent(e.target.dataset.ip)+'&n='+encodeURIComponent(n.trim()),{headers:CSRF_HDRS}).then(load);return}
 if(e.target.classList.contains('lkb')){lkd.open=true;qcl.value=e.target.dataset.k;loadQ();lkd.scrollIntoView({behavior:'smooth'});return}
-if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
+if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load);
+if(e.target.classList.contains('dres'))fetch('/devresume?k='+encodeURIComponent(e.target.dataset.k)+'&ip='+encodeURIComponent(e.target.dataset.ip),{headers:CSRF_HDRS}).then(load)});
+ct.addEventListener('change',e=>{let t=e.target;if(!t.classList.contains('dps'))return;let v=t.value;t.blur();if(v==='')return;
+fetch('/devpause?k='+encodeURIComponent(t.dataset.k)+'&ip='+encodeURIComponent(t.dataset.ip)+'&s='+v,{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
+al.addEventListener('click',e=>{if(e.target.classList.contains('rmal'))fetch('/unallow?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function saveDns(){fetch('/setdns?p='+encodeURIComponent(dns1.value.trim())+'&b='+encodeURIComponent(dns2.value.trim()),{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})}
@@ -134,7 +148,7 @@ function reboot(){fetch('/reboot',{headers:CSRF_HDRS}).then(r=>{if(r.ok)waitBack
 function resetStats(){fetch('/resetstats',{headers:CSRF_HDRS}).then(r=>{devmsg.textContent=r.ok?'✓ stats reset':'✗ '+r.status;load()})}
 async function exportCfg(){let r=await fetch('/export.json',{headers:CSRF_HDRS});if(!r.ok){devmsg.textContent='✗ '+r.status;return}
 let a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download='c3adblock-settings-'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(a.href)}
-function resetSettings(){if(prompt('This clears custom domains, bans, names, DNS and auto-update, then restarts.\nType RESET to confirm.')!=='RESET')return;
+function resetSettings(){if(prompt('This clears custom and allowed domains, bans, paused devices, names, DNS and auto-update, then restarts.\nType RESET to confirm.')!=='RESET')return;
 fetch('/resetsettings?c=RESET',{headers:CSRF_HDRS}).then(r=>{if(r.ok)waitBack();else r.text().then(t=>devmsg.textContent='✗ '+t)}).catch(waitBack)}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
