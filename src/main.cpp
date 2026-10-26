@@ -96,6 +96,8 @@ uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
 uint32_t updateIntervalH = 24;      // hours between auto-fetches
 uint32_t lastCheckMs = 0;
+int updateAtMin = -1;               // daily update time as a UTC minute of the day (-1 = use the interval)
+long lastAtSlot = -1;               // which day's timed update already ran
 String updateStatus = "never";
 
 // WiFi provisioning (captive portal)
@@ -955,7 +957,8 @@ static void handleStats() {
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
              ",\"dnsbackup\":" + (primaryDownUntil && (int32_t)(primaryDownUntil - millis()) > 0 ? "true" : "false") +
-             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upat\":" + updateAtMin +
+             ",\"utc\":" + (uint32_t)(time(nullptr) > 1600000000 ? time(nullptr) : 0) + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
@@ -1165,11 +1168,13 @@ static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
+  String at = f.readStringUntil('\n'); at.trim(); if (at.length()) updateAtMin = at.toInt();
   f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  if (updateAtMin < -1 || updateAtMin >= 1440) updateAtMin = -1;
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+  f.println(updateUrl); f.println(updateIntervalH); f.println(updateAtMin); f.close();
 }
 // ---------- upstream resolver config (/dns.cfg: primary, backup) ----------
 static void loadDnsCfg() {
@@ -1406,6 +1411,8 @@ void setup() {
       Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
+  useUpstreamForOwnLookups();                // NTP below must not ask this device for DNS
+  configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC clock for the timed blocklist update
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
@@ -1488,7 +1495,7 @@ void setup() {
     j += "],\"paused\":[";
     for (int i = 0, n = 0; i < numPauses; i++) if (!devPauses[i].until) { j += (n++ ? "," : ""); j += "\"" + devKeyStr(devPauses[i]) + "\""; }
     j += "],\"dns\":[\"" + upDns[0].toString() + "\",\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"]" +
-         ",\"update\":{\"url\":\"" + jesc(updateUrl) + "\",\"hours\":" + updateIntervalH + "}}";
+         ",\"update\":{\"url\":\"" + jesc(updateUrl) + "\",\"hours\":" + updateIntervalH + ",\"at\":" + updateAtMin + "}}";
     web.send(200, "application/json", j);
   });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
@@ -1498,6 +1505,7 @@ void setup() {
     if (!requireAuth()) return;
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    if (web.hasArg("at")) { int a = web.arg("at").toInt(); updateAtMin = web.arg("at").length() && a >= 0 && a < 1440 ? a : -1; lastAtSlot = -1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.on("/queries.json", []() {          // recent lookups per device: [ageSec, clientIp, name, qtype, status]
@@ -1560,7 +1568,15 @@ void loop() {
   expirePauses();
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
+    if (updateAtMin >= 0) {               // once a day at a set time: the DNS pause while it downloads lands at a quiet hour
+      time_t t = time(nullptr);
+      if (t > 1600000000 && now - lastCheckMs >= 10000) {   // clock synced; look every 10 s
+        lastCheckMs = now;
+        long m = (long)(t / 60) - updateAtMin, slot = m / 1440;
+        if (m % 1440 < 60 && slot != lastAtSlot) { lastAtSlot = slot; fetchBlocklist(updateUrl); }   // 1 h window, once a day
+      }
+    }
+    else if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet

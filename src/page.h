@@ -44,9 +44,9 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
 <h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
-<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
+<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h or daily at <input id=uat type=time>
 <button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). Set a daily time (your time zone) to update at a quiet hour: DNS pauses for about 15 s while a new list downloads. Leave it empty to use the hours. An unchanged list is skipped. last: <span id=ustat>&mdash;</span></div>
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/&lt;env&gt;/firmware.bin</code> (env = c3, c3-supermini or esp32dev) &mdash; device verifies it and reboots into it. running: <code id=fwver>&mdash;</code></div>
@@ -102,7 +102,8 @@ cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-al
 al.tBodies[0].innerHTML=ALW.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmal data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';}
+if(document.activeElement!=uat)uat.value=s.upat>=0?hhmm((s.upat-new Date().getTimezoneOffset()+2880)%1440):'';
+ustat.textContent=(s.upstat||'—')+(s.upat>=0&&!s.utc?' (device clock not set yet)':'');}
 let CL={},ROW={},QD=[],CUST=[],ALW=[];
 // clients table sort: column + direction, remembered in this browser (default: busiest first)
 let SORT={k:'total',d:-1};try{let v=JSON.parse(localStorage.ctsort);if(['name','ip','blocked','allowed','total'].includes(v.k)&&(v.d==1||v.d==-1))SORT=v}catch(_){}
@@ -137,7 +138,9 @@ ct.addEventListener('change',e=>{let t=e.target;if(!t.classList.contains('dps'))
 fetch('/devpause?k='+encodeURIComponent(t.dataset.k)+'&ip='+encodeURIComponent(t.dataset.ip)+'&s='+v,{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 al.addEventListener('click',e=>{if(e.target.classList.contains('rmal'))fetch('/unallow?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
+function hhmm(m){return String(m/60|0).padStart(2,'0')+':'+String(m%60).padStart(2,'0')}
+function saveUpd(){const t=uat.value.split(':'),at=uat.value?((+t[0])*60+(+t[1])+new Date().getTimezoneOffset()+2880)%1440:-1;  // device keeps UTC
+fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)+'&at='+at,{headers:CSRF_HDRS}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function saveDns(){fetch('/setdns?p='+encodeURIComponent(dns1.value.trim())+'&b='+encodeURIComponent(dns2.value.trim()),{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})}
 function defDns(){fetch('/setdns?def=1',{headers:CSRF_HDRS}).then(load)}
