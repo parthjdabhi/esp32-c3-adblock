@@ -80,8 +80,8 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h
 
-# 2. build the blocklist hash table (default = StevenBlack base + AdGuard DNS filter,
-#    ~230k entries, WhatsApp/social safe)
+# 2. build the blocklist hash table (default = StevenBlack base + AdGuard DNS filter
+#    + YouTube ad hosts, ~240k entries, WhatsApp/social safe)
 python3 tools/build_blocklist.py data/blocklist.bin
 
 # 3. flash firmware + the blocklist filesystem (the one and only USB flash)
@@ -173,7 +173,7 @@ The dashboard at **http://c3adblock.local** does it all:
 
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule. A fresh default list is rebuilt **every Monday** by GitHub Actions and
+  on a schedule. A fresh default list is rebuilt **every day** by GitHub Actions and
   published at a stable URL, so pasting this once keeps a device current on its own:
   `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin`
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
