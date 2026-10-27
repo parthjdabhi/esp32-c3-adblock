@@ -22,6 +22,7 @@
 #include "lwip/priv/nd6_priv.h"   // IPv6 neighbor cache, for IPv6 clients' MACs
 #include "lwip/sockets.h"
 #include "esp_netif.h"
+#include "esp_task_wdt.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -99,6 +100,11 @@ uint32_t lastCheckMs = 0;
 int updateAtMin = -1;               // daily update time as a UTC minute of the day (-1 = use the interval)
 long lastAtSlot = -1;               // which day's timed update already ran
 String updateStatus = "never";
+// why the device last started, shown on the dashboard so an outage can be explained afterwards
+RTC_NOINIT_ATTR uint32_t restartNote;     // survives ESP.restart(): set when we restart ourselves over WiFi
+static const uint32_t NOTE_WIFI = 0x57494649;
+String bootReason = "";
+uint16_t wifiDrops = 0;                   // WiFi disconnects since boot
 
 // WiFi provisioning (captive portal)
 Preferences prefs;
@@ -952,7 +958,7 @@ static void handleStats() {
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\",\"boot\":\"" + bootReason + "\",\"wdrops\":" + wifiDrops +
              ",\"ip6\":[" + ip6List() + "],\"q6\":" + String(queries6) + ",\"blformat\":\"" + jesc(blFormat) + "\",\"dropped\":" + String(droppedQueries) + ",\"cachehits\":" + String(cacheHits) + ",\"ver\":\"" FW_VERSION "\",\"chip\":\"" + String(ESP.getChipModel()) + "\"" +
              ",\"dns1\":\"" + upDns[0].toString() + "\",\"dns2\":\"" + ((uint32_t)upDns[1] ? upDns[1].toString() : String("")) + "\"" +
              ",\"dnsok\":[" + upAnswered[0] + "," + upAnswered[1] + "],\"dnsto\":[" + upTimeouts[0] + "," + upTimeouts[1] + "]" +
@@ -1240,6 +1246,7 @@ static bool fetchBlocklist(String url) {
   f.write(hdr, total);
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
+    esp_task_wdt_reset();                // a slow download is not a freeze
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) break; delay(2); }
   }
@@ -1387,13 +1394,38 @@ static void startConfigPortal() {
   while (true) {
     dnsPortal.processNextRequest(); web.handleClient(); delay(2);
     if (WiFi.softAPgetStationNum() > 0) t0 = millis();          // someone is setting it up
-    if (configured && millis() - t0 > 180000UL) { Serial.println("[setup] retrying WiFi"); ESP.restart(); }
+    if (configured && millis() - t0 > 180000UL) { Serial.println("[setup] retrying WiFi"); restartNote = NOTE_WIFI; ESP.restart(); }
   }
+}
+
+static String resetReason() {
+  const bool wifi = restartNote == NOTE_WIFI; restartNote = 0;
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return wifi ? "WiFi was down, restarted itself" : "restart (dashboard or update)";
+    case ESP_RST_PANIC:    return "crash";
+    case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: return "froze (watchdog)";
+    case ESP_RST_BROWNOUT: return "power dip";
+    case ESP_RST_EXT:      return "reset button";
+    default:               return "other (" + String((int)esp_reset_reason()) + ")";
+  }
+}
+// The device once sat offline for hours after a WiFi drop. Reconnect after 2 min, restart after 5.
+static void wifiWatchdog() {
+  static uint32_t downAt = 0, checkMs = 0; static bool kicked = false;
+  const uint32_t now = millis();
+  if (now - checkMs < 1000) return;
+  checkMs = now;
+  if (WiFi.status() == WL_CONNECTED) { downAt = 0; kicked = false; return; }
+  if (!downAt) { downAt = now | 1; wifiDrops++; Serial.println("[wifi] lost"); return; }
+  if (!kicked && now - downAt > 120000UL) { kicked = true; Serial.println("[wifi] down 2 min, reconnecting"); WiFi.reconnect(); }
+  if (now - downAt > 300000UL) { Serial.println("[wifi] down 5 min, restarting"); restartNote = NOTE_WIFI; ESP.restart(); }
 }
 
 void setup() {
   Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION);
+  bootReason = resetReason();
+  Serial.println("\n[c3-adblock] booting, firmware " FW_VERSION ", last reset: " + bootReason);
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   reopenBlocklist();
   loadList(custom); loadList(allow); loadBanned(); loadPauses(); loadUpdateCfg(); loadDnsCfg(); loadNames(); loadAuto();
@@ -1413,6 +1445,8 @@ void setup() {
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   useUpstreamForOwnLookups();                // NTP below must not ask this device for DNS
   configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC clock for the timed blocklist update
+  esp_task_wdt_init(60, true);               // loop stuck for 60 s -> reset (shows as "froze") instead of sitting offline
+  esp_task_wdt_add(NULL);
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
@@ -1560,6 +1594,8 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
+  wifiWatchdog();
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
